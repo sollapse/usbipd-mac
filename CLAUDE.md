@@ -68,16 +68,24 @@ unmounting nor ejecting does; capture is a different operation. `bind` no longer
 refuses held devices, it says what attaching will take. `sudo usbipd probe <busid>`
 opens a device exactly as an attach does.
 
-Mass storage is the open question. Apple documents its storage drivers as kept on
-their interfaces by `kUSBReEnumerateCaptureDeviceBit` (USB.h); IOUSBHost's capture
-documentation names no exception. A device with mounted volumes is refused rather
-than captured. If macOS keeps the interface, `usbipd kext <busid>` writes a codeless
-kext (`CodelessClaimKext`) whose personalities out-match the storage class drivers
-with a bare IOService; loading it needs SIP off, since Apple does not grant
-KEXT-enabled Developer ID signing for personal use. On macOS 27 an interface the
-storage stack holds fails to open with `kIOReturnInternalError`, not
-`kIOReturnExclusiveAccess`, so a driver attached to an interface is what marks it
-held.
+Mass storage works, measured on macOS 27.0.1 (M4 Mac mini) with a USB BD-RE drive
+(18a5:0428) through `sudo usbipd probe`. Three things it took:
+- **Capture terminates the storage driver.** The old interface node stays behind.
+  Without a fresh selection the driver can be found back on it; selecting
+  configuration 0, then the current one with `matchInterfaces: false`, gives a new
+  interface node with nothing on it.
+- **The Full Disk Access check.** That interface then opens only for a process with
+  Full Disk Access. Without it, the open fails with `kIOReturnInternalError`, which
+  root does not get past.
+- **`kIOReturnInternalError` while the driver is still attached.** That is also what
+  macOS 27 returns before capture, rather than `kIOReturnExclusiveAccess`. So a driver
+  attached to an interface is what marks it held.
+
+`usbipd probe` prints each step: interface registry IDs and attached drivers before
+and after. A device with mounted volumes is refused rather than captured.
+`usbipd kext <busid>` (`CodelessClaimKext`) remains as a fallback for a release that
+keeps a storage driver on anyway. Its personalities out-match the storage class
+drivers with a bare IOService; loading it needs SIP off.
 
 "USB-serial" is not one answer, and this file gave the wrong one twice — first that
 none of it works, then that all of it does. It depends on which driver macOS attaches:

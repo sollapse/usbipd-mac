@@ -19,9 +19,12 @@ public enum USBDeviceOpenError: Error, CustomStringConvertible, LocalizedError, 
     case captureNeedsRoot(busid: String, holders: [String])
     /// The device carries mounted volumes. Taking it would cut them off unflushed.
     case volumesMounted(busid: String, mountPoints: [String])
-    /// Interfaces stayed held after the device was captured. macOS keeps its mass
-    /// storage drivers on their interfaces even then.
+    /// Interfaces stayed held after the device was captured.
     case interfacesStillHeld(busid: String, interfaces: [UInt8], holders: [String])
+    /// The capture freed a storage interface, but macOS lets only a process with Full
+    /// Disk Access open it. `launchedFrom` is the chain of processes this one was
+    /// started from, the app among them being the one macOS asks about.
+    case storageNeedsFullDiskAccess(busid: String, interface: UInt8, launchedFrom: [String])
     case openFailed(busid: String, operation: String, result: IOReturn)
 
     public var description: String {
@@ -37,9 +40,18 @@ public enum USBDeviceOpenError: Error, CustomStringConvertible, LocalizedError, 
         case .interfacesStillHeld(let busid, let interfaces, let holders):
             let list = interfaces.map(String.init).joined(separator: ", ")
             return "macOS would not release interface \(list) of \(busid) "
-                + "(\(holders.joined(separator: ", "))). Mass storage drivers keep their "
-                + "interfaces even when the device is captured; `usbipd kext \(busid)` "
-                + "writes a codeless kext that keeps them off this device"
+                + "(\(holders.joined(separator: ", "))). If that is a storage interface, "
+                + "`usbipd kext \(busid)` writes a codeless kext that keeps its driver off "
+                + "this device"
+        case .storageNeedsFullDiskAccess(let busid, let interface, let launchedFrom):
+            let app = launchedFrom.first { $0.hasSuffix(".app") }
+            let grantee = app.map { "\($0), which this usbipd was started from" }
+                ?? "the usbipd binary itself, since no app started it"
+            return "macOS let go of \(busid), but opening its storage interface \(interface) "
+                + "needs Full Disk Access, and this process does not have it (started from: "
+                + "\(launchedFrom.joined(separator: " < "))). Grant it to \(grantee), in "
+                + "System Settings > Privacy & Security > Full Disk Access, restart that app, "
+                + "and try again"
         case .openFailed(let busid, let operation, let result):
             return "\(operation) failed for \(busid): \(USBIOReturn.describe(result))"
         }
@@ -77,11 +89,16 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     private var endpoints: [UInt8: USBEndpointInfo] = [:]
     private var isClosed = false
 
-    private init(busid: String, device: IOUSBHostDevice, queue: DispatchQueue, captured: Bool) {
+    /// Receives a line for each step of opening the device, for `usbipd probe`.
+    private let trace: ((String) -> Void)?
+
+    private init(busid: String, device: IOUSBHostDevice, queue: DispatchQueue, captured: Bool,
+                 trace: ((String) -> Void)? = nil) {
         self.busid = busid
         self.device = device
         self.queue = queue
         self.captured = captured
+        self.trace = trace
     }
 
     deinit {
@@ -93,8 +110,11 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     /// Open the device at `busid` for serving, taking it from macOS's drivers if they
     /// hold any of its interfaces.
     ///
-    /// - Parameter onTerminated: called when the device goes away, from IOUSBHost's queue.
-    public static func open(busid: String, onTerminated: @escaping @Sendable () -> Void) throws -> IOUSBHostDeviceIO {
+    /// - Parameters:
+    ///   - trace: receives a line for each step, which `usbipd probe` prints.
+    ///   - onTerminated: called when the device goes away, from IOUSBHost's queue.
+    public static func open(busid: String, trace: ((String) -> Void)? = nil,
+                            onTerminated: @escaping @Sendable () -> Void) throws -> IOUSBHostDeviceIO {
         guard let service = findService(busid: busid) else {
             throw USBDeviceOpenError.notFound(busid: busid)
         }
@@ -110,11 +130,21 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         // Try it as it is first. A device nothing has claimed opens without capture,
         // and capture resets the device when it is given back, which is not worth
         // doing to one that never needed it.
+        trace?("Opening \(busid) as it is. Its interfaces:")
+        interfaceReport(under: service).forEach { trace?("  \($0)") }
         var heldInterfaces: [UInt8] = []
-        if let plain = try? IOUSBHostDevice(__ioService: service, options: [], queue: queue, interestHandler: handler) {
-            let io = IOUSBHostDeviceIO(busid: busid, device: plain, queue: queue, captured: false)
+        let plain: IOUSBHostDevice?
+        do {
+            plain = try IOUSBHostDevice(__ioService: service, options: [], queue: queue, interestHandler: handler)
+        } catch {
+            trace?("The device itself would not open (\(USBIOReturn.describe(ioReturn(from: error))))")
+            plain = nil
+        }
+        if let plain = plain {
+            let io = IOUSBHostDeviceIO(busid: busid, device: plain, queue: queue, captured: false, trace: trace)
             do {
                 try io.openInterfaces(of: service)
+                trace?("Opened without capture")
                 return io
             } catch HeldInterfaces.held(let numbers) {
                 heldInterfaces = numbers
@@ -136,6 +166,7 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             throw USBDeviceOpenError.volumesMounted(busid: busid, mountPoints: mounted)
         }
 
+        trace?("Capturing \(busid) from \(holders.joined(separator: ", "))")
         let capturedDevice: IOUSBHostDevice
         do {
             capturedDevice = try IOUSBHostDevice(__ioService: service, options: [.deviceCapture],
@@ -144,10 +175,14 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             throw USBDeviceOpenError.openFailed(busid: busid, operation: "Capturing the device",
                                                 result: ioReturn(from: error))
         }
+        trace?("Captured")
 
-        let io = IOUSBHostDeviceIO(busid: busid, device: capturedDevice, queue: queue, captured: true)
+        // The capture terminates the drivers, but the interfaces they were on can stay
+        // behind with them. Selecting the configuration again, unmatched, gives fresh
+        // interfaces nothing has claimed.
+        let io = IOUSBHostDeviceIO(busid: busid, device: capturedDevice, queue: queue, captured: true, trace: trace)
         do {
-            try io.openInterfaces(of: service)
+            try io.openInterfaces(of: service, reselectingConfiguration: true)
         } catch HeldInterfaces.held(let numbers) {
             let stillHeld = driverNames(under: service, interfaces: numbers)
             io.close()
@@ -162,45 +197,100 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         case held([UInt8])
     }
 
+    /// How one round of opening a configuration's interfaces came out.
+    private enum OpenOutcome {
+        case opened([UInt8: IOUSBHostInterface])
+        /// Interfaces a driver still holds.
+        case held([UInt8])
+        /// A storage interface no driver holds, refused by the Full Disk Access check.
+        case needsFullDiskAccess(UInt8)
+    }
+
     /// Open every interface of the current configuration, configuring the device first
-    /// if nothing has.
-    private func openInterfaces(of service: io_service_t) throws {
+    /// if nothing has, and selecting the configuration again first if asked to.
+    private func openInterfaces(of service: io_service_t, reselectingConfiguration: Bool = false) throws {
         if device.configurationDescriptor == nil {
             let first: UnsafePointer<IOUSBConfigurationDescriptor>
             do {
                 first = try device.configurationDescriptor(with: 0)
                 try device.__configure(withValue: Int(first.pointee.bConfigurationValue), matchInterfaces: false)
+                trace?("Configured with configuration \(first.pointee.bConfigurationValue), unmatched")
             } catch {
                 throw USBDeviceOpenError.openFailed(busid: busid, operation: "Configuring the device",
                                                     result: ioReturn(from: error))
             }
         }
 
-        guard let configuration = device.configurationDescriptor else { return }
+        guard let configuration = device.configurationDescriptor else {
+            trace?("The device has no configuration")
+            return
+        }
         let expected = Int(configuration.pointee.bNumInterfaces)
         let value = configuration.pointee.bConfigurationValue
 
-        // Interfaces appear as the configuration is applied, so give them a moment.
-        var services = waitForInterfaces(of: service, expected: expected)
-
-        // A capture terminates every client of the device. If that took the interfaces
-        // with it, select the configuration again to have them made anew, unmatched.
-        if services.count < expected && captured {
-            services.forEach { IOObjectRelease($0) }
-            logger.info("\(busid) lost its interfaces to the capture; selecting configuration \(value) again")
-            try? device.__configure(withValue: 0, matchInterfaces: false)
+        // A capture terminates every client of the device, and may leave the interfaces
+        // behind with drivers that are going or come back. A fresh selection of the
+        // configuration, unmatched, makes interfaces nothing holds.
+        if captured && reselectingConfiguration {
+            Self.waitQuiet(service)
+            trace?("After the capture:")
+            Self.interfaceReport(under: service).forEach { trace?("  \($0)") }
+            do {
+                try device.__configure(withValue: 0, matchInterfaces: false)
+                trace?("Selected configuration 0")
+            } catch {
+                trace?("Selecting configuration 0 failed: \(USBIOReturn.describe(ioReturn(from: error)))")
+            }
+            Self.waitQuiet(service)
             do {
                 try device.__configure(withValue: Int(value), matchInterfaces: false)
+                trace?("Selected configuration \(value) again, unmatched")
             } catch {
                 throw USBDeviceOpenError.openFailed(busid: busid, operation: "Reconfiguring the device",
                                                     result: ioReturn(from: error))
             }
-            services = waitForInterfaces(of: service, expected: expected)
+            Self.waitQuiet(service)
+            trace?("After selecting it again:")
+            Self.interfaceReport(under: service).forEach { trace?("  \($0)") }
         }
-        defer { services.forEach { IOObjectRelease($0) } }
 
+        // A driver a capture terminated can take a moment to finish going, so on a
+        // captured device a held interface is tried again for a few seconds before it
+        // counts as held.
+        let attempts = captured ? 8 : 1
+        var last = OpenOutcome.held([])
+        for attempt in 1...attempts {
+            let services = waitForInterfaces(of: service, expected: expected)
+            last = try openAll(services)
+            services.forEach { IOObjectRelease($0) }
+
+            if case .opened(let opened) = last {
+                install(opened)
+                return
+            }
+            if attempt < attempts {
+                Thread.sleep(forTimeInterval: 0.5)
+                Self.waitQuiet(service)
+            }
+        }
+
+        switch last {
+        case .needsFullDiskAccess(let number):
+            throw USBDeviceOpenError.storageNeedsFullDiskAccess(busid: busid, interface: number,
+                                                                launchedFrom: ProcessLineage.chain())
+        case .held(let numbers):
+            throw HeldInterfaces.held(numbers)
+        case .opened:
+            return
+        }
+    }
+
+    /// One attempt at opening every interface. Anything opened is let go again unless
+    /// all of them open.
+    private func openAll(_ services: [io_service_t]) throws -> OpenOutcome {
         var opened: [UInt8: IOUSBHostInterface] = [:]
         var held: [UInt8] = []
+        var fullDiskAccess: UInt8?
         for interfaceService in services {
             let number = Self.uint8Property(interfaceService, "bInterfaceNumber") ?? UInt8(opened.count + held.count)
             do {
@@ -211,9 +301,19 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
                 // kIOReturnExclusiveAccess: macOS 27 reports kIOReturnInternalError for
                 // one its mass storage driver has. Any failure on an interface with a
                 // driver attached is taken as that driver's doing.
+                //
+                // With no driver left, kIOReturnInternalError on a storage interface is
+                // macOS's Full Disk Access check: a process without it is refused
+                // whatever its privileges, and one with it opens the interface at once.
                 let result = ioReturn(from: error)
-                if result == USBIOReturn.exclusiveAccess || result == USBIOReturn.notPermitted
-                    || !Self.driverNames(of: interfaceService).isEmpty {
+                let drivers = Self.driverNames(of: interfaceService)
+                trace?("Interface \(number) would not open (\(USBIOReturn.describe(result))); "
+                       + (drivers.isEmpty ? "no driver on it" : "on it: \(drivers.joined(separator: ", "))"))
+                if drivers.isEmpty && result == USBIOReturn.internalError
+                    && Self.uint8Property(interfaceService, "bInterfaceClass") == 0x08 {
+                    fullDiskAccess = number
+                } else if result == USBIOReturn.exclusiveAccess || result == USBIOReturn.notPermitted
+                            || !drivers.isEmpty {
                     held.append(number)
                 } else {
                     opened.values.forEach { $0.destroy() }
@@ -223,11 +323,19 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             }
         }
 
+        if let number = fullDiskAccess {
+            opened.values.forEach { $0.destroy() }
+            return .needsFullDiskAccess(number)
+        }
         guard held.isEmpty else {
             opened.values.forEach { $0.destroy() }
-            throw HeldInterfaces.held(held.sorted())
+            return .held(held.sorted())
         }
+        return .opened(opened)
+    }
 
+    /// Take over a set of open interfaces and their endpoints.
+    private func install(_ opened: [UInt8: IOUSBHostInterface]) {
         lock.lock()
         defer { lock.unlock() }
         interfaces = opened
@@ -238,6 +346,32 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             let alternate = interface.interfaceDescriptor.pointee.bAlternateSetting
             alternates[number] = alternate
             addEndpointsLocked(of: interface, number: number, alternate: alternate)
+        }
+    }
+
+    /// Wait for IOKit to finish matching and terminating below a service.
+    private static func waitQuiet(_ service: io_service_t, seconds: UInt32 = 2) {
+        var wait = mach_timespec_t(tv_sec: seconds, tv_nsec: 0)
+        _ = IOServiceWaitQuiet(service, &wait)
+    }
+
+    /// One line per interface below a device: number, alternate setting, class, registry
+    /// entry, and whatever is attached to it.
+    static func interfaceReport(under service: io_service_t) -> [String] {
+        let services = interfaceServices(under: service)
+        defer { services.forEach { IOObjectRelease($0) } }
+        guard !services.isEmpty else { return ["no interfaces"] }
+
+        return services.map { interfaceService in
+            var entryID: UInt64 = 0
+            IORegistryEntryGetRegistryEntryID(interfaceService, &entryID)
+            let number = uint8Property(interfaceService, "bInterfaceNumber").map(String.init) ?? "?"
+            let alternate = uint8Property(interfaceService, "bAlternateSetting").map(String.init) ?? "?"
+            let interfaceClass = uint8Property(interfaceService, "bInterfaceClass").map { String(format: "%02x", $0) } ?? "?"
+            let drivers = driverNames(of: interfaceService)
+            return "interface \(number) alternate \(alternate) class \(interfaceClass) "
+                + "(entry \(String(format: "0x%llx", entryID))): "
+                + (drivers.isEmpty ? "no driver" : drivers.joined(separator: ", "))
         }
     }
 

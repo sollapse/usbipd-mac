@@ -306,11 +306,14 @@ public class BindCommand: Command {
                 if drivers.contains(where: { $0.contains("MassStorage") || $0.contains("UAS") }) {
                     print("""
 
-                        It is a storage device: eject its volumes before attaching, since taking
-                        it would cut them off unflushed (the daemon refuses while one is
-                        mounted). If macOS still keeps the storage interface, run
-                        `usbipd kext \(busidText)` for a codeless kext that keeps its driver off
-                        this device.
+                        It is a storage device:
+                        - Eject its volumes before attaching. Taking it would cut them off
+                          unflushed, so the daemon refuses while one is mounted.
+                        - macOS opens a storage interface only to a process with Full Disk
+                          Access. Grant it in System Settings > Privacy & Security > Full Disk
+                          Access, to the terminal app the daemon runs from, or to the usbipd
+                          binary when it runs at boot.
+                        `sudo usbipd probe \(busidText)` checks both without a client.
                         """)
                 }
 

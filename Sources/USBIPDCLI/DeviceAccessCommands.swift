@@ -38,7 +38,9 @@ public class ProbeCommand: Command {
 
         let io: IOUSBHostDeviceIO
         do {
-            io = try IOUSBHostDeviceIO.open(busid: busid) {}
+            // Each step is printed: what macOS does with a captured device is the whole
+            // question this command answers.
+            io = try IOUSBHostDeviceIO.open(busid: busid, trace: { print("  - \($0)") }) {}
         } catch let error as USBDeviceOpenError {
             print("Cannot serve \(busid): \(error)")
             throw CommandHandlerError.deviceAttachmentFailed(error.description)

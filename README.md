@@ -22,15 +22,16 @@
 > not needed for this. `bind` says what attaching will take from macOS; `sudo usbipd
 > probe <busid>` opens a device exactly as an attach would and reports the outcome.
 >
-> **Mass storage needs one more step if macOS keeps it.** Apple documents its mass
-> storage drivers as staying on their interfaces when a device is captured
-> (`kUSBReEnumerateCaptureDeviceBit` in USB.h); whether IOUSBHost's capture shares that
-> exception is what `usbipd probe` tells you. A device whose volumes are mounted is
-> refused rather than captured, since capturing it would cut them off unflushed: eject
-> them first. If macOS keeps the storage interface, `usbipd kext <busid>` writes a
-> codeless kext that keeps the driver off that device model entirely. Loading it needs
-> System Integrity Protection off (Permissive Security), because Apple does not grant
-> KEXT-enabled Developer ID signing for personal use; the command prints the steps.
+> **Mass storage needs Full Disk Access.** Capturing a storage device terminates its
+> driver; the daemon then selects the configuration again so the interface comes back
+> unclaimed, and macOS lets only a process with Full Disk Access open it. Grant it in
+> System Settings > Privacy & Security > Full Disk Access — to the terminal app the
+> daemon runs from, or to the `usbipd` binary when it runs at boot. Measured on macOS
+> 27.0.1 with a USB BD-RE drive. A device whose volumes are mounted is refused rather
+> than captured, since capturing it would cut them off unflushed: eject them first. If
+> some macOS release keeps a storage interface anyway, `usbipd kext <busid>` writes a
+> codeless kext that keeps the driver off that device model; loading it needs System
+> Integrity Protection off, and the command prints the steps.
 >
 > The capture path, isochronous transfers and the kext are new and have not yet been
 > validated against hardware. Seizing the interface (`USBInterfaceOpenSeize`) was

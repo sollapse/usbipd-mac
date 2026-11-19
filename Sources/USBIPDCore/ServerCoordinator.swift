@@ -297,9 +297,10 @@ public class ServerCoordinator: USBIPServer {
 
     /// Opens a device for a client that imports it. The IOUSBHost device layer, unless a
     /// test supplies another.
-    public var openDeviceIO: (_ busid: String, _ onTerminated: @escaping @Sendable () -> Void) throws -> USBDeviceIO = {
-        busid, onTerminated in
-        try IOUSBHostDeviceIO.open(busid: busid, onTerminated: onTerminated)
+    public var openDeviceIO: (_ busid: String, _ trace: @escaping (String) -> Void,
+                              _ onTerminated: @escaping @Sendable () -> Void) throws -> USBDeviceIO = {
+        busid, trace, onTerminated in
+        try IOUSBHostDeviceIO.open(busid: busid, trace: trace, onTerminated: onTerminated)
     }
 
     /// Guards the two tables below.
@@ -449,7 +450,10 @@ public class ServerCoordinator: USBIPServer {
         }
 
         do {
-            let io = try openDeviceIO(busid) { [weak state] in
+            // What opening the device took is worth having in the log: whether it had to
+            // be captured, and what macOS did with its interfaces.
+            let log = logger
+            let io = try openDeviceIO(busid, { line in log.info("\(busid): \(line)") }) { [weak state] in
                 // The device went away. Closing the connection tells the client, as
                 // Linux's server does, and the disconnect hands the device back.
                 state?.closeConnection?()

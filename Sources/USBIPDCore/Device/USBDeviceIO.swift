@@ -156,6 +156,7 @@ public enum USBIOReturn {
     public static let notResponding = IOReturn(bitPattern: 0xE000_02ED)
     public static let exclusiveAccess = IOReturn(bitPattern: 0xE000_02C5)
     public static let notOpen = IOReturn(bitPattern: 0xE000_02CD)
+    public static let internalError = IOReturn(bitPattern: 0xE000_02C9)
     public static let notPermitted = IOReturn(bitPattern: 0xE000_02E2)
     public static let badArgument = IOReturn(bitPattern: 0xE000_02C2)
     public static let unsupported = IOReturn(bitPattern: 0xE000_02C7)
