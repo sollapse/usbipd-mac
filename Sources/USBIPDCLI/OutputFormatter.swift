@@ -113,6 +113,8 @@ public class LinuxCompatibleOutputFormatter: OutputFormatter {
             return "High (480 Mbps)"
         case .superSpeed:
             return "Super (5 Gbps)"
+        case .superSpeedPlus:
+            return "Super+ (10 Gbps or more)"
         }
     }
     

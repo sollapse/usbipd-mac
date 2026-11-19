@@ -219,13 +219,8 @@ extension IOKitDeviceDiscovery {
     private func determineUSBSpeed(from service: io_service_t) -> USBSpeed {
         // Try to get speed from various IOKit properties
         if let speedValue = getUInt32Property(from: service, key: "Device Speed") {
-            switch speedValue {
-            case 0: return .low
-            case 1: return .full
-            case 2: return .high
-            case 3: return .superSpeed
-            default: return .unknown
-            }
+            // 4 and 5 are SuperSpeed+ (10 and 20 Gbps). They used to read as unknown.
+            return USBSpeed(ioKitDeviceSpeed: speedValue)
         }
         
         // Fallback: try to determine from device class or other properties
