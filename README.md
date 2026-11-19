@@ -13,23 +13,31 @@
 > Request/response devices are unaffected. See
 > [Documentation/development/android-adb-validation.md](Documentation/development/android-adb-validation.md).
 >
-> **Which do not:** HID, mass storage, audio and cameras, whose drivers hold the
-> interface exclusively. `bind` refuses these with an explanation rather than failing later.
-> Releasing them needs the DriverKit USB transport entitlements
-> (`com.apple.developer.driverkit`, `com.apple.developer.driverkit.transport.usb`),
-> which Apple must approve. **That request was denied on 25 February 2026.** Apple
-> redirected it to `com.apple.developer.usb.host-controller-interface`, which enables
-> a virtual USB host controller — the capability a USB/IP *client* needs, not the one
-> this server needs. See
-> [Documentation/development/entitlement-validation.md](Documentation/development/entitlement-validation.md).
+> **Devices macOS holds** — HID, audio, cameras, CDC-ACM, mass storage — are taken from
+> macOS when a client attaches them, and given back when it detaches. IOUSBHost lets
+> root *capture* a device: the drivers and clients on it are terminated, and on release
+> the device is reset and they match it again. That needs no entitlement, only the
+> daemon running as root (`sudo brew services start usbip`). The DriverKit USB transport
+> entitlements this project asked Apple for were denied on 25 February 2026, and are
+> not needed for this. `bind` says what attaching will take from macOS; `sudo usbipd
+> probe <busid>` opens a device exactly as an attach would and reports the outcome.
 >
-> Seizing the interface was measured and does **not** work, and neither unmounting nor
-> ejecting a device releases it. There is no workaround short of that entitlement.
+> **Mass storage needs one more step if macOS keeps it.** Apple documents its mass
+> storage drivers as staying on their interfaces when a device is captured
+> (`kUSBReEnumerateCaptureDeviceBit` in USB.h); whether IOUSBHost's capture shares that
+> exception is what `usbipd probe` tells you. A device whose volumes are mounted is
+> refused rather than captured, since capturing it would cut them off unflushed: eject
+> them first. If macOS keeps the storage interface, `usbipd kext <busid>` writes a
+> codeless kext that keeps the driver off that device model entirely. Loading it needs
+> System Integrity Protection off (Permissive Security), because Apple does not grant
+> KEXT-enabled Developer ID signing for personal use; the command prints the steps.
 >
-> Note this is *not* the App Sandbox entitlement `com.apple.security.device.usb`, which
-> is freely usable and grants nothing here — see
+> The capture path, isochronous transfers and the kext are new and have not yet been
+> validated against hardware. Seizing the interface (`USBInterfaceOpenSeize`) was
+> measured and does not release a driver, and neither unmounting nor ejecting releases
+> it; capture is a different operation. Note this is also *not* the App Sandbox entitlement
+> `com.apple.security.device.usb`, which is freely usable and grants nothing here — see
 > [Documentation/development/entitlement-validation.md](Documentation/development/entitlement-validation.md).
-> Run `./Scripts/validate-usb-entitlements.sh` to check your own hardware.
 
 # usbipd-mac
 
@@ -44,9 +52,12 @@ usbipd-mac is a macOS implementation of the USB/IP protocol that allows sharing 
 - USB device sharing from macOS to other systems over network
 - Compatible with the standard Linux `usbip` client — verified with a real client
   performing enumeration, control transfers and bulk transfers
-- `bind` refuses devices macOS already owns, naming the owner, instead of failing
-  later at transfer time
-- No System Extension or entitlement required for the devices it can serve
+- Every interface of a device is served: control, bulk, interrupt and isochronous
+  transfers (isochronous needs macOS 12), alternate settings and configurations,
+  SuperSpeed and SuperSpeed+ speeds
+- Devices macOS holds are captured from its drivers when a client attaches, as root,
+  and handed back when it detaches
+- No System Extension or entitlement required
 
 ## Requirements
 

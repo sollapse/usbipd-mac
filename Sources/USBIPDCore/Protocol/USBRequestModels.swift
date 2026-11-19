@@ -7,7 +7,7 @@ import IOKit.usb
 import Common
 
 /// USB transfer type enumeration matching USB specification
-public enum USBTransferType: UInt8 {
+public enum USBTransferType: UInt8, Sendable {
     case control = 0
     case isochronous = 1
     case bulk = 2

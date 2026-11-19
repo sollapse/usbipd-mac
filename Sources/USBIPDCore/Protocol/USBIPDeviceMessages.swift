@@ -27,6 +27,42 @@ public struct DeviceListRequest: USBIPMessageCodable {
     }
 }
 
+/// One `struct usbip_usb_interface`: an interface's class triple, as a device list
+/// describes it.
+public struct USBIPExportedInterface: Equatable, Sendable {
+    public let interfaceClass: UInt8
+    public let interfaceSubClass: UInt8
+    public let interfaceProtocol: UInt8
+
+    public init(interfaceClass: UInt8, interfaceSubClass: UInt8, interfaceProtocol: UInt8) {
+        self.interfaceClass = interfaceClass
+        self.interfaceSubClass = interfaceSubClass
+        self.interfaceProtocol = interfaceProtocol
+    }
+
+    /// Class, subclass, protocol and a padding byte.
+    public func encode() -> Data {
+        return Data([interfaceClass, interfaceSubClass, interfaceProtocol, 0])
+    }
+}
+
+/// What the device layer knows about a device beyond what discovery reports: its
+/// configuration and its interfaces.
+public struct USBIPDeviceDescription: Equatable, Sendable {
+    public let bcdDevice: UInt16
+    public let configurationCount: UInt8
+    public let configurationValue: UInt8
+    public let interfaces: [USBIPExportedInterface]
+
+    public init(bcdDevice: UInt16, configurationCount: UInt8, configurationValue: UInt8,
+                interfaces: [USBIPExportedInterface]) {
+        self.bcdDevice = bcdDevice
+        self.configurationCount = configurationCount
+        self.configurationValue = configurationValue
+        self.interfaces = interfaces
+    }
+}
+
 /// Exported device information for device list response
 public struct USBIPExportedDevice: USBIPMessageCodable {
     public let path: String
@@ -45,7 +81,10 @@ public struct USBIPExportedDevice: USBIPMessageCodable {
     public let configurationCount: UInt8
     public let configurationValue: UInt8
     public let interfaceCount: UInt8
-    
+    /// The interfaces a device list follows this record with. When empty, or not
+    /// `interfaceCount` long, zeroed records are written in their place.
+    public let interfaces: [USBIPExportedInterface]
+
     public init(
         path: String,
         busID: String,
@@ -60,8 +99,10 @@ public struct USBIPExportedDevice: USBIPMessageCodable {
         deviceProtocol: UInt8,
         configurationCount: UInt8,
         configurationValue: UInt8,
-        interfaceCount: UInt8
+        interfaceCount: UInt8,
+        interfaces: [USBIPExportedInterface] = []
     ) {
+        self.interfaces = interfaces
         self.path = path
         self.busID = busID
         self.busnum = busnum
@@ -179,12 +220,16 @@ public struct DeviceListResponse: USBIPMessageCodable {
             // so a client that consumed them read into the *next* device's path —
             // visible as interface classes like 2f/73/79, which is ASCII "/sy".
             //
-            // Per-interface descriptors are not currently plumbed through from device
-            // discovery, so these are emitted as zeros, which a client renders as
-            // "(Defined at Interface level)". The stream is correct; the interface
-            // detail is simply not populated yet.
-            for _ in 0..<Int(device.interfaceCount) {
-                data.append(contentsOf: [0 as UInt8, 0, 0, 0])
+            // When the interfaces are not known they are written as zeros, which a
+            // client renders as "(Defined at Interface level)".
+            if device.interfaces.count == Int(device.interfaceCount) {
+                for interface in device.interfaces {
+                    data.append(interface.encode())
+                }
+            } else {
+                for _ in 0..<Int(device.interfaceCount) {
+                    data.append(contentsOf: [0 as UInt8, 0, 0, 0])
+                }
             }
         }
 
@@ -215,16 +260,28 @@ public struct DeviceListResponse: USBIPMessageCodable {
             }
 
             let deviceData = data.subdata(in: offset..<(offset + 312))
-            let device = try USBIPExportedDevice.decode(from: deviceData)
-            devices.append(device)
+            let record = try USBIPExportedDevice.decode(from: deviceData)
             offset += 312
 
             // Then bNumInterfaces × struct usbip_usb_interface, four bytes each.
-            let interfaceBytes = Int(device.interfaceCount) * 4
+            let interfaceBytes = Int(record.interfaceCount) * 4
             guard data.count >= offset + interfaceBytes else {
                 throw USBIPProtocolError.invalidDataLength
             }
+            let interfaces = (0..<Int(record.interfaceCount)).map { index -> USBIPExportedInterface in
+                let base = data.startIndex + offset + index * 4
+                return USBIPExportedInterface(interfaceClass: data[base], interfaceSubClass: data[base + 1],
+                                              interfaceProtocol: data[base + 2])
+            }
             offset += interfaceBytes
+
+            devices.append(USBIPExportedDevice(
+                path: record.path, busID: record.busID, busnum: record.busnum, devnum: record.devnum,
+                speed: record.speed, vendorID: record.vendorID, productID: record.productID,
+                bcdDevice: record.bcdDevice, deviceClass: record.deviceClass,
+                deviceSubClass: record.deviceSubClass, deviceProtocol: record.deviceProtocol,
+                configurationCount: record.configurationCount, configurationValue: record.configurationValue,
+                interfaceCount: record.interfaceCount, interfaces: interfaces))
         }
         
         return DeviceListResponse(header: header, devices: devices)

@@ -178,7 +178,7 @@ extension CompletionIntegrationTests {
         // Must match the commands the CLI actually registers. install-system-extension
         // and diagnose were removed — the first could not succeed from a Homebrew
         // prefix, the second did not complete.
-        let expectedCommands = ["help", "list", "bind", "unbind", "daemon", "status", "completion"]
+        let expectedCommands = ["help", "list", "bind", "unbind", "daemon", "status", "probe", "kext", "completion"]
 
         // Removed commands must not reappear in generated completions, which is how
         // attach and detach lingered in the fish script after being deleted.

@@ -268,75 +268,57 @@ public class BindCommand: Command {
             
             let deviceIdentifier = "\(device.busID)-\(device.deviceID)"
 
-            // Refuse devices something else already owns, before promising to share
-            // them. This used to allow-list anything and only surface the problem when
-            // a transfer failed, on a machine the user was no longer looking at.
+            // Say who holds the device, and what attaching will do about it. Nothing is
+            // taken from macOS here: binding only offers the device. The daemon captures
+            // it when a client attaches and gives it back when the client detaches,
+            // which is what usbipd-win does on Windows.
             let ownership = ownershipInspector.ownership(vendorID: device.vendorID, productID: device.productID)
+            let busidText = busid
+            let captureNote = """
+                When a client attaches, the daemon takes the device from them and gives it
+                back when the client detaches. Taking it needs the daemon to run as root
+                (sudo brew services start usbip).
+                """
             switch ownership {
             case .unbound:
                 break
 
             case .noInterfaces:
-                // Nothing to open, so nothing can be served. Accepting the bind here
-                // produced a device that looked shared and failed every transfer with
-                // "Interface 0 not found".
-                logger.info("Refusing to bind a device with no interfaces", context: ["busid": busid])
-                print("Cannot share \(busid): the device exposes no USB interfaces.")
-                print("macOS has not configured it, which usually means another process is")
-                print("driving it directly — a browser tab using WebUSB, for instance. Quit")
-                print("that program and try again.")
-                throw CommandLineError.invalidArguments("Device \(busid) exposes no USB interfaces")
+                // Not configured: usually another process is driving it directly, a
+                // browser tab using WebUSB for instance. The daemon configures it when a
+                // client attaches.
+                logger.info("Binding a device with no interfaces", context: ["busid": busid])
+                print("Note: macOS has not configured \(busidText), so it exposes no interfaces yet.")
+                print("The daemon configures it when a client attaches. If another program is")
+                print("driving it directly (a browser tab using WebUSB, say), quit that first.")
 
-            case .partiallyClaimed(let free, let claimedBy):
-                // Some interfaces are owned and some are not. A composite debug probe
-                // looks like this: CMSIS-DAP free, the CDC serial port taken by macOS.
-                // Refusing the whole device here rejected hardware that works.
+            case .partiallyClaimed(_, let claimedBy):
                 let names = claimedBy.joined(separator: ", ")
-                let list = free.map(String.init).joined(separator: ", ")
-                logger.info("Binding a partially claimed device", context: [
-                    "busid": busid,
-                    "freeInterfaces": list,
-                    "claimedBy": names
-                ])
-                print("Note: macOS holds some interfaces of \(busid) (\(names)).")
-                print("Interface \(list) is free and will be served — for a debug probe")
-                print("that is the debug interface; the serial port stays with macOS.")
+                logger.info("Binding a partially claimed device", context: ["busid": busid, "claimedBy": names])
+                print("Note: macOS holds some interfaces of \(busidText) (\(names)).")
+                print(captureNote)
 
             case .kernelDriver(let drivers):
                 let names = drivers.joined(separator: ", ")
-                logger.error("Refusing to bind a driver-bound device", context: [
-                    "busid": busid,
-                    "drivers": names
-                ])
-                // Printed rather than folded into the thrown error: the error string is
-                // also logged as context, and a multi-line message there is unreadable.
-                print("""
-                    Cannot share \(busid): macOS has bound a driver to it (\(names)).
+                logger.info("Binding a driver-bound device", context: ["busid": busid, "drivers": names])
+                print("Note: macOS has bound drivers to \(busidText) (\(names)).")
+                print(captureNote)
+                if drivers.contains(where: { $0.contains("MassStorage") || $0.contains("UAS") }) {
+                    print("""
 
-                    Releasing it needs a DriverKit entitlement Apple has to grant.
-                    Seizing the interface was measured and does not work, and neither
-                    unmounting nor ejecting releases it.
-
-                    Devices macOS does not claim — debug probes, boards in DFU mode,
-                    vendor-specific interfaces — work today. Check a specific device
-                    with ./Scripts/validate-usb-entitlements.sh
-                    """)
-                throw CommandHandlerError.deviceBindingFailed("\(busid) is owned by \(names)")
+                        It is a storage device: eject its volumes before attaching, since taking
+                        it would cut them off unflushed (the daemon refuses while one is
+                        mounted). If macOS still keeps the storage interface, run
+                        `usbipd kext \(busidText)` for a codeless kext that keeps its driver off
+                        this device.
+                        """)
+                }
 
             case .userspaceProcess(let clients):
                 let names = clients.joined(separator: ", ")
-                logger.error("Refusing to bind a device held by another process", context: [
-                    "busid": busid,
-                    "clients": names
-                ])
-                print("""
-                    Cannot share \(busid): another process has it open (\(names)).
-
-                    Quit whatever is using the device — a camera or audio app, a
-                    browser tab holding it over WebUSB — and bind again. Unlike a
-                    kernel driver, this needs no entitlement.
-                    """)
-                throw CommandHandlerError.deviceBindingFailed("\(busid) is open in another process")
+                logger.info("Binding a device another process holds", context: ["busid": busid, "clients": names])
+                print("Note: another process has \(busidText) open (\(names)).")
+                print(captureNote)
             }
 
             // Step 3: Record the device as bound.
@@ -354,17 +336,13 @@ public class BindCommand: Command {
             logger.info("Successfully bound device", context: ["busid": busid])
             print("✓ Device \(busid) added to server configuration")
 
-            // Do not assert exclusive control. Nothing is claimed from macOS; bind
-            // refuses driver-bound and process-held devices up front, so reaching here
-            // means nothing else owns the interface.
+            // Nothing is claimed from macOS yet; that happens when a client attaches.
             let identity = "\(busid): \(String(format: "%04x", device.vendorID)):\(String(format: "%04x", device.productID)) (\(device.productString ?? "Unknown"))"
             print("Bound device \(identity)")
-            // Do not claim the whole device is free when only some of it is.
-            if case .partiallyClaimed = ownership {
-                print("Registered for USB/IP sharing. The free interface is served;")
-                print("the interfaces macOS holds are not.")
-            } else {
+            if case .unbound = ownership {
                 print("Registered for USB/IP sharing. No driver or process holds this device.")
+            } else {
+                print("Registered for USB/IP sharing. macOS keeps the device until a client attaches.")
             }
         } catch let handlerError as CommandHandlerError {
             // Already carries its own message. Re-wrapping produced the doubled
@@ -386,9 +364,12 @@ public class BindCommand: Command {
         print("Usage: usbipd bind <busid>")
         print("")
         print("Bind a USB device for sharing through USB/IP. This command:")
-        print("1. Refuses the device if macOS or another process holds its interfaces")
+        print("1. Says whether macOS or another process holds the device's interfaces")
         print("2. Adds the device to the server's allowed device list")
-        print("3. Prepares the device for remote USB/IP connections")
+        print("")
+        print("macOS keeps the device until a client attaches. The daemon then takes it from")
+        print("macOS's drivers, which needs it to run as root, and gives it back when the")
+        print("client detaches.")
         print("")
         print("Arguments:")
         print("  busid           The bus ID of the USB device to bind (e.g., 1-1)")
@@ -398,8 +379,9 @@ public class BindCommand: Command {
         print("  -h, --help      Show this help message")
         print("")
         print("Notes:")
-        print("- Device will be unavailable to host system while bound")
-        print("- Use 'usbipd unbind' to release the device")
+        print("- The device is unavailable to macOS while a client has it attached")
+        print("- Eject a storage device's volumes before attaching it")
+        print("- Use 'usbipd unbind' to stop offering the device")
     }
 }
 

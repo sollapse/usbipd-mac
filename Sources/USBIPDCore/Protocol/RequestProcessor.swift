@@ -35,8 +35,29 @@ public final class USBIPConnectionState {
 
     private let lock = NSLock()
     private var _phase: Phase = .handshake
+    private var _attachment: USBIPAttachment?
+    private var _send: ((Data) -> Void)?
+    private var _closeConnection: (() -> Void)?
 
     public init() {}
+
+    /// The device this connection imported, once it has, which serves its URB traffic.
+    public var attachment: USBIPAttachment? {
+        get { lock.lock(); defer { lock.unlock() }; return _attachment }
+        set { lock.lock(); _attachment = newValue; lock.unlock() }
+    }
+
+    /// Sends bytes to this connection's client. Set by the server.
+    public var send: ((Data) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _send }
+        set { lock.lock(); _send = newValue; lock.unlock() }
+    }
+
+    /// Closes this connection. Set by the server.
+    public var closeConnection: (() -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _closeConnection }
+        set { lock.lock(); _closeConnection = newValue; lock.unlock() }
+    }
 
     public var phase: Phase {
         lock.lock(); defer { lock.unlock() }
@@ -84,6 +105,43 @@ public class RequestProcessor {
 
     /// USB request handler for SUBMIT/UNLINK operations (will be injected later)
     private var usbRequestHandler: USBRequestHandlerProtocol?
+
+    /// Opens an imported device for serving, before the import is answered, so a device
+    /// that cannot be served is refused at import rather than failing every transfer
+    /// after it. Set by the server. When nil an import succeeds without opening
+    /// anything, which is what direct unit-test construction relies on.
+    public var attachmentOpener: ((USBDevice, USBIPConnectionState) throws -> USBIPAttachment)?
+
+    /// Reads a device's configuration and interfaces for the device list and the import
+    /// reply. Set by the server; when nil, one interface of unknown class is reported.
+    public var deviceDescriber: ((USBDevice) -> USBIPDeviceDescription?)?
+
+    /// The usbip_usb_device record for a device, with what the describer knows about it.
+    private func exportedDevice(for device: USBDevice) -> USBIPExportedDevice {
+        let description = deviceDescriber?(device)
+        let interfaces = description?.interfaces ?? []
+        return USBIPExportedDevice(
+            path: "/sys/devices/\(device.busID)-\(device.deviceID)",
+            // The busid a client passes to `usbip attach` is the composed bus-device
+            // identifier. Advertising only the bus number made every device on the
+            // host report the same busid, "1", so a client could not name one to
+            // import.
+            busID: "\(device.busID)-\(device.deviceID)",
+            busnum: UInt32(device.busID) ?? 0,
+            devnum: USBIPDeviceIdentity.devnum(forPortPath: device.deviceID) ?? 0,
+            speed: device.speed.usbipSpeed,
+            vendorID: device.vendorID,
+            productID: device.productID,
+            bcdDevice: description?.bcdDevice ?? 0,
+            deviceClass: device.deviceClass,
+            deviceSubClass: device.deviceSubClass,
+            deviceProtocol: device.deviceProtocol,
+            configurationCount: description?.configurationCount ?? 1,
+            configurationValue: description?.configurationValue ?? 1,
+            interfaceCount: interfaces.isEmpty ? 1 : UInt8(truncatingIfNeeded: interfaces.count),
+            interfaces: interfaces
+        )
+    }
     
     /// Logger for error and diagnostic information
     private let logger: ((String, LogLevel) -> Void)?
@@ -168,7 +226,7 @@ public class RequestProcessor {
                 
             case .requestDeviceImport:
                 log("Processing device import request", .debug)
-                let response = try handleDeviceImportRequest(data)
+                let response = try handleDeviceImportRequest(data, connectionState: connectionState)
                 // Everything after a successful import is URB traffic on this same
                 // socket, framed differently. Only flip on success: a rejected import
                 // leaves the connection in the handshake phase.
@@ -253,26 +311,8 @@ public class RequestProcessor {
             // Convert USBDevice objects to USBIPExportedDevice objects
             log("Converting device information to USB/IP format", .debug)
             let exportedDevices = devices.map { device -> USBIPExportedDevice in
-                let exportedDevice = USBIPExportedDevice(
-                    path: "/sys/devices/\(device.busID)-\(device.deviceID)",
-                    // The busid a client passes to `usbip attach` is the composed
-                    // bus-device identifier. Advertising only the bus number made every
-                    // device on the host report the same busid, "1", so a client could
-                    // not name one to import.
-                    busID: "\(device.busID)-\(device.deviceID)",
-                    busnum: UInt32(device.busID) ?? 0,
-                    devnum: USBIPDeviceIdentity.devnum(forPortPath: device.deviceID) ?? 0,
-                    speed: device.speed.usbipSpeed,
-                    vendorID: device.vendorID,
-                    productID: device.productID,
-                    deviceClass: device.deviceClass,
-                    deviceSubClass: device.deviceSubClass,
-                    deviceProtocol: device.deviceProtocol,
-                    configurationCount: 1, // Default value for MVP
-                    configurationValue: 1, // Default value for MVP
-                    interfaceCount: 1      // Default value for MVP
-                )
-                
+                let exportedDevice = self.exportedDevice(for: device)
+
                 log("Prepared device for response", .debug, [
                     "busID": device.busID,
                     "deviceID": device.deviceID,
@@ -321,7 +361,7 @@ public class RequestProcessor {
     }
     
     /// Handle a device import request
-    private func handleDeviceImportRequest(_ data: Data) throws -> Data {
+    private func handleDeviceImportRequest(_ data: Data, connectionState: USBIPConnectionState) throws -> Data {
         // Decode the request
         log("Decoding device import request", .debug)
         let request = try USBIPMessageDecoder.decodeDeviceImportRequest(from: data)
@@ -423,25 +463,23 @@ public class RequestProcessor {
                 }
             }
             
+            // Open the device now, taking it from macOS's drivers if need be. Failing
+            // here answers the import with an error, which `usbip attach` reports, and
+            // leaves the reason in this log.
+            if let opener = attachmentOpener {
+                do {
+                    connectionState.attachment = try opener(device, connectionState)
+                } catch {
+                    log("Cannot serve \(request.busID): \(error)", .error)
+                    throw error
+                }
+            }
+
             // Create and encode the response (success)
             log("Creating device import response", .debug)
             // OP_REP_IMPORT carries the full usbip_usb_device on success; a header-only
             // reply leaves the client blocked waiting for 312 bytes.
-            let importedDevice = USBIPExportedDevice(
-                path: "/sys/devices/\(device.busID)-\(device.deviceID)",
-                busID: "\(device.busID)-\(device.deviceID)",
-                busnum: UInt32(device.busID) ?? 0,
-                devnum: USBIPDeviceIdentity.devnum(forPortPath: device.deviceID) ?? 0,
-                speed: device.speed.usbipSpeed,
-                vendorID: device.vendorID,
-                productID: device.productID,
-                deviceClass: device.deviceClass,
-                deviceSubClass: device.deviceSubClass,
-                deviceProtocol: device.deviceProtocol,
-                configurationCount: 1,
-                configurationValue: 1,
-                interfaceCount: 1
-            )
+            let importedDevice = exportedDevice(for: device)
             let response = DeviceImportResponse(
                 header: USBIPHeader(
                     command: .replyDeviceImport,

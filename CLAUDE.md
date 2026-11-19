@@ -57,12 +57,27 @@ already received that announcement; attaching from a client causes no bus reset 
 phone can observe. Request/response devices are unaffected. See
 `Documentation/development/android-adb-validation.md`.
 
-**Does not work, and cannot be made to.** Devices whose interfaces macOS actually
-holds — HID, mass storage, audio, cameras. `bind` refuses these up front with an
-explanation naming the owner. This was measured, not assumed: `USBInterfaceOpenSeize`
-returns the same `kIOReturnExclusiveAccess` as a plain open, and neither unmounting
-nor ejecting releases a device. Only the DriverKit USB transport entitlements would
-change it, and Apple has to grant those.
+**Devices macOS holds are captured, not refused — unvalidated on hardware.** HID,
+audio, cameras, CDC-ACM and mass storage are taken from macOS when a client attaches
+them: `IOUSBHostDeviceIO` opens the device through IOUSBHost and, when a driver holds
+an interface, recreates it with `IOUSBHostObjectInitOptionsDeviceCapture`, which root
+may use without the `com.apple.vm.device-access` entitlement. The drivers are
+terminated; destroying the device on detach resets it and lets them match again.
+`USBInterfaceOpenSeize` (measured, 2026-08-06) does not release a driver and neither
+unmounting nor ejecting does; capture is a different operation. `bind` no longer
+refuses held devices, it says what attaching will take. `sudo usbipd probe <busid>`
+opens a device exactly as an attach does.
+
+Mass storage is the open question. Apple documents its storage drivers as kept on
+their interfaces by `kUSBReEnumerateCaptureDeviceBit` (USB.h); IOUSBHost's capture
+documentation names no exception. A device with mounted volumes is refused rather
+than captured. If macOS keeps the interface, `usbipd kext <busid>` writes a codeless
+kext (`CodelessClaimKext`) whose personalities out-match the storage class drivers
+with a bare IOService; loading it needs SIP off, since Apple does not grant
+KEXT-enabled Developer ID signing for personal use. On macOS 27 an interface the
+storage stack holds fails to open with `kIOReturnInternalError`, not
+`kIOReturnExclusiveAccess`, so a driver attached to an interface is what marks it
+held.
 
 "USB-serial" is not one answer, and this file gave the wrong one twice — first that
 none of it works, then that all of it does. It depends on which driver macOS attaches:
@@ -76,9 +91,9 @@ none of it works, then that all of it does. It depends on which driver macOS att
   interface (class 2, `AppleUSBACMControl`) returns `kIOReturnExclusiveAccess`. The
   data path carries the bytes; the control path carries `SET_LINE_CODING` and
   `SET_CONTROL_LINE_STATE` — baud rate, DTR and RTS. So a CDC-ACM device cannot be
-  served usefully: a client can be handed the bytes but can never set the line up.
-  This is the class most dev boards with native USB present, and it is the one case
-  where a DriverKit entitlement would actually change the answer.
+  served usefully without capture: a client can be handed the bytes but can never set
+  the line up. Capturing the device as root should release the control half with the
+  rest; that has not been tried on hardware.
   Note also that `AppleUSBACMData` publishes `/dev/cu.*` through `IOSerialBSDClient`
   while that interface is simultaneously openable — the conflict hazard, confirmed.
 - **CH340, PL2303 and the rest** have not been measured. Do not assume either way.
@@ -86,10 +101,22 @@ none of it works, then that all of it does. It depends on which driver macOS att
 Which is why ownership is decided by attempting the open rather than by reading driver
 names: a driver being attached settles nothing, and the chip alone does not tell you.
 
-**Untested.** Interrupt endpoints (no unbound interrupt device has been available).
-Isochronous is not merely untested but structurally incomplete: alternate settings are
-never selected and pipes are discovered once at open, so a UVC device's isochronous
-endpoints would never appear. See `Documentation/development/probe-rs-validation.md`.
+**The attached-device path.** An import opens the device before it is answered and
+hands the connection to a `USBIPAttachment`, which queues every URB with IOUSBHost as
+it arrives and replies from the completion; nothing blocks, and each endpoint keeps
+its order. It carries out SET_CONFIGURATION (through the host, unmatched by macOS's
+drivers), SET_INTERFACE (replacing the interface's pipes), CLEAR_FEATURE(ENDPOINT_HALT)
+(device side by request, host side by `clearStall`) and answers SET_ADDRESS and port
+resets itself. Isochronous transfers are IOUSBHost transaction lists, one per USB/IP
+packet (macOS 12+). The TCP stream is framed by `USBIPStreamFramer`; before that, each
+read was taken as exactly one message. The older `USBRequestHandler` /
+`USBSubmitProcessor` / `IOKitUSBInterface` pipeline is now reached only by unit tests
+that build a `RequestProcessor` without an attachment opener.
+
+**Untested on hardware.** Everything in the paragraph above, interrupt endpoints and
+isochronous streams in particular. `USBIPAttachmentTests` drive the attachment against
+a recording device. See `Documentation/development/probe-rs-validation.md` for how
+interop was validated before.
 
 The **SystemExtension subsystem was removed in 0.7.0** — some 24,000 lines that no
 shipping path could reach. `OSSystemExtensionRequest` resolves extensions inside the
@@ -100,12 +127,10 @@ implementation would slot into, satisfied by `UserspaceDeviceClaimManager`, whic
 intent and says so. See
 `Documentation/development/system-extension-archive/why-it-was-removed.md`.
 
-Serving the devices macOS *does* hold — HID, mass storage, audio, cameras, and CDC-ACM
-control interfaces — needs a DriverKit extension, which needs an app bundle in
-`/Applications` to activate it, which needs a capability Apple has not granted. That
-work is planned but not started: see
-`Documentation/development/app-bundle-phase-2.md`, which records the measurements, the
-chosen non-breaking distribution shape, and the two questions to settle first.
+A DriverKit extension would serve held devices without root and without capture, but
+needs an app bundle in `/Applications` and a capability Apple has not granted; see
+`Documentation/development/app-bundle-phase-2.md`. Capture makes it unnecessary for
+everything except, possibly, mass storage.
 
 ## Architecture
 

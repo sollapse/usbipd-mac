@@ -539,24 +539,13 @@ final class CLIDeviceDiscoveryIntegrationTests: XCTestCase {
         
         let busid = "\(firstDevice.busID)-\(firstDevice.deviceID)"
 
-        // Whether the first device on the host is servable is not this test's business
-        // — on a developer machine it is usually a hub or a keyboard that macOS owns.
-        // Assert the outcome that matches the device rather than assuming it binds,
-        // which made the result depend on what happened to be plugged in.
-        let ownership = DeviceOwnershipInspector().ownership(
-            vendorID: firstDevice.vendorID, productID: firstDevice.productID)
-
-        if ownership.isServable {
-            XCTAssertNoThrow(try bindCommand.execute(with: [busid]),
-                             "An unowned device should bind")
-            XCTAssertTrue(boundDevices.isBound(busid),
-                          "Device should be added to allowed devices")
-        } else {
-            XCTAssertThrowsError(try bindCommand.execute(with: [busid]),
-                                 "A device another driver or process owns must be refused")
-            XCTAssertFalse(boundDevices.isBound(busid),
-                           "A refused device must not be added to allowed devices")
-        }
+        // Whatever holds the first device on the host — on a developer machine usually
+        // a hub or a keyboard that macOS owns — binding only offers it. The daemon takes
+        // it from macOS when a client attaches.
+        XCTAssertNoThrow(try bindCommand.execute(with: [busid]),
+                         "Binding offers a device whoever holds it")
+        XCTAssertTrue(boundDevices.isBound(busid),
+                      "Device should be added to allowed devices")
     }
     
     func testIOKitDeviceDiscoveryWithUnbindCommand() throws {

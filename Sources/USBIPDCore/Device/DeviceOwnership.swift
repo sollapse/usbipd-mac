@@ -1,23 +1,28 @@
 // DeviceOwnership.swift
-// Determines whether anything already owns a USB device, before we promise to share it.
+// Determines whether anything already owns a USB device, so bind can say so.
 
 import Foundation
 import IOKit
 import Common
 
 /// Who currently holds a device's interfaces.
+///
+/// This no longer decides whether a device can be shared. When a client attaches, the
+/// daemon captures a held device from whatever holds it (IOUSBHost lets root do that)
+/// and gives it back on detach. What this reports tells the user what attaching will
+/// take away from macOS, and what it needs.
 public enum DeviceOwnership: Equatable {
     /// Nothing has matched against the interfaces. This is the servable case.
     case unbound
 
-    /// A kernel driver owns at least one interface. Releasing it needs DriverKit
-    /// rebinding, which requires an entitlement Apple has to grant — measured on
-    /// 2026-08-06, `USBInterfaceOpenSeize` does not help.
+    /// A kernel driver owns at least one interface. `USBInterfaceOpenSeize` does not
+    /// release it (measured on 2026-08-06); capturing the device as root does, except
+    /// that Apple documents mass storage drivers as kept even then.
     case kernelDriver(drivers: [String])
 
-    /// A userspace process holds the interfaces open. Blocks a claim just as firmly,
-    /// but quitting that process frees the device, so the two must not be reported
-    /// alike — one is a dead end, the other is a thing the user can act on.
+    /// A userspace process holds the interfaces open. Quitting that process frees the
+    /// device without taking anything from macOS, so it is reported apart from a
+    /// kernel driver.
     case userspaceProcess(clients: [String])
 
     /// The device exposes no interfaces at all, so there is nothing to open.
@@ -36,8 +41,9 @@ public enum DeviceOwnership: Equatable {
     /// refused hardware that works, which is most of what this project is for.
     case partiallyClaimed(freeInterfaces: [Int], claimedBy: [String])
 
-    /// Whether anything can be served. A device with one free interface is usable —
-    /// the debug half of a composite probe is exactly the part anyone wants.
+    /// Whether some of the device can be served without taking it from anyone. A device
+    /// with one free interface qualifies: the debug half of a composite probe is exactly
+    /// the part anyone wants.
     public var isServable: Bool {
         switch self {
         case .unbound, .partiallyClaimed:

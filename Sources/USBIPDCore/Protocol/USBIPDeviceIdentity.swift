@@ -20,6 +20,27 @@ import Common
 /// `locationID` in the first place, so `2.1.3` becomes 0x213.
 enum USBIPDeviceIdentity {
 
+    /// The bus number and dotted port path of the device at an IOKit locationID.
+    ///
+    /// locationID is 0xBBPPPPPP: the top byte identifies the controller, and each
+    /// remaining nibble is the port used at successive hub tiers, zero-padded. The whole
+    /// path is kept, matching the form Linux usbip uses, e.g. "32-2.1.3": keeping only
+    /// the first port collapsed every device behind a hub onto one busid.
+    static func busID(forLocationID locationID: UInt32) -> (busID: String, deviceID: String) {
+        let busNumber = (locationID >> 24) & 0xFF
+
+        var ports: [UInt32] = []
+        for shift in stride(from: 20, through: 0, by: -4) {
+            ports.append((locationID >> UInt32(shift)) & 0xF)
+        }
+        while let last = ports.last, last == 0 {
+            ports.removeLast()
+        }
+
+        let portPath = ports.isEmpty ? "0" : ports.map(String.init).joined(separator: ".")
+        return (String(busNumber), portPath)
+    }
+
     /// Pack a dotted hub port path into the low 16 bits of a devid.
     ///
     /// Returns nil when the path cannot be represented: more than four tiers, or a port

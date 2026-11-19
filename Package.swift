@@ -41,7 +41,8 @@ let package = Package(
             name: "USBIPDCore",
             dependencies: ["Common"],
             linkerSettings: [
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("IOUSBHost")
             ]),
         .target(
             name: "Common",

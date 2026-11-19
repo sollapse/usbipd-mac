@@ -294,7 +294,24 @@ public class ServerCoordinator: USBIPServer {
     
     /// Maximum concurrent requests per client connection
     private let maxConcurrentRequestsPerClient: Int
-    
+
+    /// Opens a device for a client that imports it. The IOUSBHost device layer, unless a
+    /// test supplies another.
+    public var openDeviceIO: (_ busid: String, _ onTerminated: @escaping @Sendable () -> Void) throws -> USBDeviceIO = {
+        busid, onTerminated in
+        try IOUSBHostDeviceIO.open(busid: busid, onTerminated: onTerminated)
+    }
+
+    /// Guards the two tables below.
+    private let connectionsLock = NSLock()
+
+    /// Devices a client has attached. Importing one twice would capture it from under
+    /// the first client.
+    private var attachedBusids: Set<String> = []
+
+    /// Per-connection state, so a disconnect can give the connection's device back.
+    private var connectionStates: [UUID: USBIPConnectionState] = [:]
+
     /// Callback for error events
     public var onError: ((Error) -> Void)?
     
@@ -402,7 +419,65 @@ public class ServerCoordinator: USBIPServer {
             )
         )
 
+        // Imported devices are served by an attachment, opened before the import is
+        // answered. See USBIPAttachment.
+        self.requestProcessor.attachmentOpener = { [weak self] device, state in
+            guard let self = self else { throw ServerError.notRunning }
+            return try self.openAttachment(for: device, state: state)
+        }
+
+        // Device lists describe each device's real interfaces.
+        self.requestProcessor.deviceDescriber = { device in
+            IOUSBHostDeviceIO.describe(busid: "\(device.busID)-\(device.deviceID)")
+        }
+
         setupCallbacks()
+    }
+
+    /// Open a device for the client on this connection.
+    private func openAttachment(for device: USBDevice, state: USBIPConnectionState) throws -> USBIPAttachment {
+        let busid = "\(device.busID)-\(device.deviceID)"
+
+        connectionsLock.lock()
+        let alreadyAttached = attachedBusids.contains(busid)
+        if !alreadyAttached {
+            attachedBusids.insert(busid)
+        }
+        connectionsLock.unlock()
+        guard !alreadyAttached else {
+            throw AttachmentError.alreadyAttached(busid)
+        }
+
+        do {
+            let io = try openDeviceIO(busid) { [weak state] in
+                // The device went away. Closing the connection tells the client, as
+                // Linux's server does, and the disconnect hands the device back.
+                state?.closeConnection?()
+            }
+            let attachment = USBIPAttachment(busid: busid, io: io, maxTransferSize: Int(config.maxUSBBufferSize)) {
+                [weak state] data in
+                state?.send?(data)
+            }
+            logger.info("Serving \(busid) to a client", context: ["busid": busid])
+            return attachment
+        } catch {
+            connectionsLock.lock()
+            attachedBusids.remove(busid)
+            connectionsLock.unlock()
+            throw error
+        }
+    }
+
+    /// Stop serving a connection's device, if it has one, and give it back to macOS.
+    private func closeAttachment(of state: USBIPConnectionState) {
+        guard let attachment = state.attachment else { return }
+        state.attachment = nil
+        attachment.close()
+
+        connectionsLock.lock()
+        attachedBusids.remove(attachment.busid)
+        connectionsLock.unlock()
+        logger.info("Stopped serving \(attachment.busid)", context: ["busid": attachment.busid])
     }
     
     /// Set up callbacks for network and device events
@@ -420,6 +495,17 @@ public class ServerCoordinator: USBIPServer {
             // successful import this socket switches from op_common to
             // usbip_header_basic, and nothing in the bytes says so.
             let connectionState = USBIPConnectionState()
+            let replyConnection = clientConnection
+            connectionState.send = { data in
+                // A reply for a client that has gone has nowhere to go.
+                try? replyConnection.send(data: data)
+            }
+            connectionState.closeConnection = {
+                try? replyConnection.close()
+            }
+            self.connectionsLock.lock()
+            self.connectionStates[clientConnection.id] = connectionState
+            self.connectionsLock.unlock()
 
             // TCP delivers bytes, not messages: one read can hold part of a message or
             // several of them. See USBIPStreamFramer.
@@ -453,7 +539,13 @@ public class ServerCoordinator: USBIPServer {
                         return
                     }
                     guard let message = message else { break }
-                    self.dispatch(message, from: connection, state: connectionState)
+                    if let attachment = connectionState.attachment {
+                        // Queued with the device in arrival order; replies are sent as
+                        // the transfers complete.
+                        attachment.handle(message)
+                    } else {
+                        self.dispatch(message, from: connection, state: connectionState)
+                    }
                 }
             }
             
@@ -482,6 +574,17 @@ public class ServerCoordinator: USBIPServer {
             
             // Clean up active request tracking for this client
             self.activeRequests.removeAllRequests(for: clientConnection.id)
+
+            // Give the client's device back, and break the reply closures' hold on the
+            // connection.
+            self.connectionsLock.lock()
+            let state = self.connectionStates.removeValue(forKey: clientConnection.id)
+            self.connectionsLock.unlock()
+            if let state = state {
+                self.closeAttachment(of: state)
+                state.send = nil
+                state.closeConnection = nil
+            }
         }
         
         // Handle device connections
@@ -629,7 +732,13 @@ public class ServerCoordinator: USBIPServer {
         
         // Stop device discovery notifications
         deviceDiscovery.stopNotifications()
-        
+
+        // Give every attached device back to macOS before the connections go.
+        connectionsLock.lock()
+        let states = Array(connectionStates.values)
+        connectionsLock.unlock()
+        states.forEach { closeAttachment(of: $0) }
+
         // Stop network service
         try networkService.stop()
         

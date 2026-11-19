@@ -200,19 +200,10 @@ extension IOKitDeviceDiscovery {
         // entry authorised all four.
         //
         // Using the whole path gives one identifier per device and matches the form
-        // Linux usbip uses, e.g. "32-2.1.3".
-        let busNumber = (locationID >> 24) & 0xFF
-
-        var ports: [UInt32] = []
-        for shift in stride(from: 20, through: 0, by: -4) {
-            ports.append((locationID >> UInt32(shift)) & 0xF)
-        }
-        while let last = ports.last, last == 0 {
-            ports.removeLast()
-        }
-
-        let portPath = ports.isEmpty ? "0" : ports.map(String.init).joined(separator: ".")
-        return (String(busNumber), portPath)
+        // Linux usbip uses, e.g. "32-2.1.3". The device layer finds a device again from
+        // the same mapping, so it lives in one place.
+        let identity = USBIPDeviceIdentity.busID(forLocationID: locationID)
+        return (identity.busID, identity.deviceID)
     }
     
     /// Determine USB speed from IOKit properties

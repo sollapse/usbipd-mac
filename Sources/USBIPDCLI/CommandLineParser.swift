@@ -76,6 +76,8 @@ public class CommandLineParser {
             BindCommand(deviceDiscovery: deviceDiscovery, boundDevices: boundDevices),
             UnbindCommand(deviceDiscovery: deviceDiscovery, boundDevices: boundDevices),
             StatusCommand(boundDevices: boundDevices),
+            ProbeCommand(),
+            KextCommand(),
             // attach/detach are deliberately not registered. usbipd is a USB/IP
             // *server*; attaching a remote device is the client's job, and both
             // commands only ever threw operationNotSupported. Listing them in --help
