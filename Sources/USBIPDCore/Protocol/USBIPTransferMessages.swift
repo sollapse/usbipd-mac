@@ -18,6 +18,64 @@ private let usbipCommandPrefixSize = USBIPProtocol.commandMessagePrefixSize
 /// Offset at which the command-specific block begins.
 private let usbipCommandBlockOffset = USBIPBasicHeader.encodedSize
 
+/// One `usbip_iso_packet_descriptor`: where a packet of an isochronous transfer sits in
+/// the transfer buffer, and how it completed.
+///
+/// A CMD_SUBMIT for an isochronous endpoint ends with one of these per packet, after the
+/// OUT data if there is any. The RET_SUBMIT echoes them back with `actualLength` and
+/// `status` filled in, after the IN data.
+public struct USBIPIsoPacketDescriptor: Equatable, Sendable {
+    public static let encodedSize = 16
+
+    /// Offset of the packet within the URB's transfer buffer.
+    public var offset: UInt32
+    /// Bytes requested for this packet.
+    public var length: UInt32
+    /// Bytes actually transferred.
+    public var actualLength: UInt32
+    /// Completion status, a negative Linux errno or 0.
+    public var status: Int32
+
+    public init(offset: UInt32, length: UInt32, actualLength: UInt32 = 0, status: Int32 = 0) {
+        self.offset = offset
+        self.length = length
+        self.actualLength = actualLength
+        self.status = status
+    }
+
+    public func encode() -> Data {
+        var data = EndiannessConverter.writeUInt32ToData(offset)
+        data.append(EndiannessConverter.writeUInt32ToData(length))
+        data.append(EndiannessConverter.writeUInt32ToData(actualLength))
+        data.append(EndiannessConverter.writeInt32ToData(status))
+        return data
+    }
+
+    public static func decode(from data: Data, at position: Int) throws -> USBIPIsoPacketDescriptor {
+        return USBIPIsoPacketDescriptor(
+            offset: try EndiannessConverter.readUInt32FromData(data, at: position),
+            length: try EndiannessConverter.readUInt32FromData(data, at: position + 4),
+            actualLength: try EndiannessConverter.readUInt32FromData(data, at: position + 8),
+            status: try EndiannessConverter.readInt32FromData(data, at: position + 12)
+        )
+    }
+
+    /// The descriptors at `position`, if all `count` of them are present.
+    ///
+    /// A message without them decodes with none rather than failing, which keeps header
+    /// fields readable from a message that was cut short. A framed message is complete.
+    static func decodeList(from data: Data, at position: Int, count: UInt32) throws -> [USBIPIsoPacketDescriptor] {
+        let packets = Int(Int32(bitPattern: count))
+        guard packets > 0, packets <= USBIPStreamFramer.maxIsoPackets,
+              data.count - position >= packets * encodedSize else {
+            return []
+        }
+        return try (0..<packets).map { index in
+            try decode(from: data, at: position + index * encodedSize)
+        }
+    }
+}
+
 /// USB/IP SUBMIT request message (USBIP_CMD_SUBMIT)
 public struct USBIPSubmitRequest: USBIPMessageCodable {
     public let seqnum: UInt32              // Unique request sequence number
@@ -31,6 +89,8 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
     public let interval: UInt32            // Polling interval for interrupt transfers
     public let setup: Data                 // 8 bytes setup packet for control transfers
     public let transferBuffer: Data?       // Variable length data for OUT transfers
+    /// One descriptor per packet of an isochronous transfer; empty otherwise.
+    public let isoPackets: [USBIPIsoPacketDescriptor]
 
     public var command: USBIPProtocol.Command { return .submitRequest }
 
@@ -50,7 +110,8 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
         numberOfPackets: UInt32 = 0,
         interval: UInt32 = 0,
         setup: Data = Data(count: 8),
-        transferBuffer: Data? = nil
+        transferBuffer: Data? = nil,
+        isoPackets: [USBIPIsoPacketDescriptor] = []
     ) {
         self.seqnum = seqnum
         self.devid = devid
@@ -63,6 +124,7 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
         self.interval = interval
         self.setup = setup
         self.transferBuffer = transferBuffer
+        self.isoPackets = isoPackets
     }
 
     public func encode() throws -> Data {
@@ -89,6 +151,11 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
             data.append(transferBuffer)
         }
 
+        // Isochronous packet descriptors come last
+        for packet in isoPackets {
+            data.append(packet.encode())
+        }
+
         return data
     }
 
@@ -104,14 +171,21 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
 
         let base = usbipCommandBlockOffset
         let transferBufferLength = try EndiannessConverter.readUInt32FromData(data, at: base + 4)
+        let numberOfPackets = try EndiannessConverter.readUInt32FromData(data, at: base + 12)
 
         // setup occupies the last 8 bytes of the command block
         let setup = data.subdata(in: (base + 20)..<usbipCommandPrefixSize)
 
+        // Only an OUT request carries data. Taking whatever followed the header as the
+        // buffer read an isochronous IN request's packet descriptors as data.
         var transferBuffer: Data?
-        if data.count > usbipCommandPrefixSize && transferBufferLength > 0 {
-            let remaining = data.subdata(in: usbipCommandPrefixSize..<data.count)
-            transferBuffer = remaining.prefix(Int(transferBufferLength))
+        var descriptorOffset = usbipCommandPrefixSize
+        if header.direction == USBIPProtocol.directionOut,
+           data.count > usbipCommandPrefixSize && transferBufferLength > 0 {
+            let available = data.count - usbipCommandPrefixSize
+            let length = min(Int(transferBufferLength), available)
+            transferBuffer = data.subdata(in: usbipCommandPrefixSize..<(usbipCommandPrefixSize + length))
+            descriptorOffset += length
         }
 
         return USBIPSubmitRequest(
@@ -122,10 +196,12 @@ public struct USBIPSubmitRequest: USBIPMessageCodable {
             transferFlags: try EndiannessConverter.readUInt32FromData(data, at: base),
             transferBufferLength: transferBufferLength,
             startFrame: try EndiannessConverter.readUInt32FromData(data, at: base + 8),
-            numberOfPackets: try EndiannessConverter.readUInt32FromData(data, at: base + 12),
+            numberOfPackets: numberOfPackets,
             interval: try EndiannessConverter.readUInt32FromData(data, at: base + 16),
             setup: setup,
-            transferBuffer: transferBuffer
+            transferBuffer: transferBuffer,
+            isoPackets: try USBIPIsoPacketDescriptor.decodeList(from: data, at: descriptorOffset,
+                                                               count: numberOfPackets)
         )
     }
 }
@@ -142,6 +218,8 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
     public let numberOfPackets: UInt32     // Number of packets for isochronous transfers
     public let errorCount: UInt32          // Error count for isochronous transfers
     public let transferBuffer: Data?       // Variable length data for IN transfers
+    /// One descriptor per packet of an isochronous transfer; empty otherwise.
+    public let isoPackets: [USBIPIsoPacketDescriptor]
 
     public var command: USBIPProtocol.Command { return .submitReply }
 
@@ -160,7 +238,8 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
         startFrame: UInt32 = 0,
         numberOfPackets: UInt32 = 0,
         errorCount: UInt32 = 0,
-        transferBuffer: Data? = nil
+        transferBuffer: Data? = nil,
+        isoPackets: [USBIPIsoPacketDescriptor] = []
     ) {
         self.seqnum = seqnum
         self.devid = devid
@@ -172,6 +251,7 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
         self.numberOfPackets = numberOfPackets
         self.errorCount = errorCount
         self.transferBuffer = transferBuffer
+        self.isoPackets = isoPackets
     }
 
     public func encode() throws -> Data {
@@ -185,9 +265,16 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
         data.append(EndiannessConverter.writeUInt32ToData(errorCount))
         data.append(Data(count: 8)) // padding, where the request carries setup
 
-        // Transfer buffer, present only on IN transfers
+        // Transfer buffer, present only on IN transfers. For an isochronous IN it holds
+        // the packets back to back, each actualLength long; the client spreads them out
+        // again using the descriptors.
         if let transferBuffer = transferBuffer {
             data.append(transferBuffer)
+        }
+
+        // Isochronous packet descriptors come last
+        for packet in isoPackets {
+            data.append(packet.encode())
         }
 
         return data
@@ -205,11 +292,15 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
 
         let base = usbipCommandBlockOffset
         let actualLength = try EndiannessConverter.readUInt32FromData(data, at: base + 4)
+        let numberOfPackets = try EndiannessConverter.readUInt32FromData(data, at: base + 12)
 
         var transferBuffer: Data?
+        var descriptorOffset = usbipCommandPrefixSize
         if data.count > usbipCommandPrefixSize && actualLength > 0 {
-            let remaining = data.subdata(in: usbipCommandPrefixSize..<data.count)
-            transferBuffer = remaining.prefix(Int(actualLength))
+            let available = data.count - usbipCommandPrefixSize
+            let length = min(Int(actualLength), available)
+            transferBuffer = data.subdata(in: usbipCommandPrefixSize..<(usbipCommandPrefixSize + length))
+            descriptorOffset += length
         }
 
         return USBIPSubmitResponse(
@@ -220,9 +311,11 @@ public struct USBIPSubmitResponse: USBIPMessageCodable {
             status: try EndiannessConverter.readInt32FromData(data, at: base),
             actualLength: actualLength,
             startFrame: try EndiannessConverter.readUInt32FromData(data, at: base + 8),
-            numberOfPackets: try EndiannessConverter.readUInt32FromData(data, at: base + 12),
+            numberOfPackets: numberOfPackets,
             errorCount: try EndiannessConverter.readUInt32FromData(data, at: base + 16),
-            transferBuffer: transferBuffer
+            transferBuffer: transferBuffer,
+            isoPackets: try USBIPIsoPacketDescriptor.decodeList(from: data, at: descriptorOffset,
+                                                               count: numberOfPackets)
         )
     }
 }
