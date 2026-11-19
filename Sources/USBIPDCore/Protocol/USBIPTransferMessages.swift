@@ -52,12 +52,19 @@ public struct USBIPIsoPacketDescriptor: Equatable, Sendable {
     }
 
     public static func decode(from data: Data, at position: Int) throws -> USBIPIsoPacketDescriptor {
-        return USBIPIsoPacketDescriptor(
-            offset: try EndiannessConverter.readUInt32FromData(data, at: position),
-            length: try EndiannessConverter.readUInt32FromData(data, at: position + 4),
-            actualLength: try EndiannessConverter.readUInt32FromData(data, at: position + 8),
-            status: try EndiannessConverter.readInt32FromData(data, at: position + 12)
-        )
+        guard position >= 0, data.count - position >= encodedSize else {
+            throw USBIPProtocolError.invalidDataLength
+        }
+        // Assembled byte by byte. The descriptors follow the transfer data, so they start
+        // wherever its length leaves them, and EndiannessConverter's loads need 4-byte
+        // alignment: a 2-byte audio sample put the first descriptor at an odd offset.
+        func word(_ offset: Int) -> UInt32 {
+            let base = data.startIndex + position + offset
+            return UInt32(data[base]) << 24 | UInt32(data[base + 1]) << 16 |
+                UInt32(data[base + 2]) << 8 | UInt32(data[base + 3])
+        }
+        return USBIPIsoPacketDescriptor(offset: word(0), length: word(4), actualLength: word(8),
+                                        status: Int32(bitPattern: word(12)))
     }
 
     /// The descriptors at `position`, if all `count` of them are present.

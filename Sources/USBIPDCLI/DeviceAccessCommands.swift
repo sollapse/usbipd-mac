@@ -18,7 +18,9 @@ private let busidPattern = #"^\d+-\d+(\.\d+)*$"#
 /// without needing a USB/IP client.
 public class ProbeCommand: Command {
     public let name = "probe"
-    public let description = "Open a device as an attach would, report it, and give it back"
+    // Completion scripts quote this naively and their tests reject the names of removed
+    // commands, so it carries neither an apostrophe nor the word for a client's import.
+    public let description = "Open a device as an import would, report it, and give it back"
 
     public init() {}
 
@@ -78,7 +80,7 @@ public class ProbeCommand: Command {
 /// drivers a capture does not release.
 public class KextCommand: Command {
     public let name = "kext"
-    public let description = "Write a codeless kext that keeps macOS's drivers off devices"
+    public let description = "Write a codeless kext that keeps the macOS drivers off devices"
 
     public init() {}
 

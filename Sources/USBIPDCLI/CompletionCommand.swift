@@ -379,6 +379,8 @@ public class CompletionCommand: Command {
             MockCommand(name: "unbind", description: "Unbind a USB device from USB/IP"),
             MockCommand(name: "daemon", description: "Start USB/IP daemon"),
             MockCommand(name: "status", description: "Show daemon status"),
+            MockCommand(name: "probe", description: "Open a device as an import would, report it, and give it back"),
+            MockCommand(name: "kext", description: "Write a codeless kext that keeps the macOS drivers off devices"),
             MockCommand(name: "completion", description: "Generate shell completion scripts")
         ]
     }

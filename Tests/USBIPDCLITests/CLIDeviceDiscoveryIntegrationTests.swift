@@ -520,7 +520,7 @@ final class CLIDeviceDiscoveryIntegrationTests: XCTestCase {
             XCTAssertLessThanOrEqual(device.deviceProtocol, 255, "Device protocol should be valid byte")
             
             // Speed should be a valid enum value
-            XCTAssertTrue([USBSpeed.unknown, .low, .full, .high, .superSpeed].contains(device.speed), 
+            XCTAssertTrue([USBSpeed.unknown, .low, .full, .high, .superSpeed, .superSpeedPlus].contains(device.speed),
                          "Speed should be valid enum value")
         }
     }

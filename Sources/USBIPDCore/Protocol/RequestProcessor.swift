@@ -463,18 +463,6 @@ public class RequestProcessor {
                 }
             }
             
-            // Open the device now, taking it from macOS's drivers if need be. Failing
-            // here answers the import with an error, which `usbip attach` reports, and
-            // leaves the reason in this log.
-            if let opener = attachmentOpener {
-                do {
-                    connectionState.attachment = try opener(device, connectionState)
-                } catch {
-                    log("Cannot serve \(request.busID): \(error)", .error)
-                    throw error
-                }
-            }
-
             // Create and encode the response (success)
             log("Creating device import response", .debug)
             // OP_REP_IMPORT carries the full usbip_usb_device on success; a header-only
@@ -487,15 +475,29 @@ public class RequestProcessor {
                 ),
                 device: importedDevice
             )
-            
+            let encoded = try USBIPMessageEncoder.encode(response)
+
+            // Open the device last, taking it from macOS's drivers if need be, so that
+            // nothing can fail after it and leave the device captured behind an error
+            // reply. A failure here answers the import with an error, which
+            // `usbip attach` reports, and leaves the reason in this log.
+            if let opener = attachmentOpener {
+                do {
+                    connectionState.attachment = try opener(device, connectionState)
+                } catch {
+                    log("Cannot serve \(request.busID): \(error)", .error)
+                    throw error
+                }
+            }
+
             log("Sending successful device import response", .info, [
                 "busID": device.busID,
                 "deviceID": device.deviceID,
                 "vendorID": String(format: "0x%04x", device.vendorID),
                 "productID": String(format: "0x%04x", device.productID)
             ])
-            
-            return try USBIPMessageEncoder.encode(response)
+
+            return encoded
         } catch {
             log("Error handling device import request: \(error.localizedDescription)", .error)
             

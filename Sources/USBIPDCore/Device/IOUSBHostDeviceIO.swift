@@ -11,7 +11,9 @@ import Common
 private let kIOMessageServiceIsTerminatedValue: UInt32 = 0xE000_0010
 
 /// Why a device could not be opened for serving.
-public enum USBDeviceOpenError: Error, CustomStringConvertible, Equatable {
+public enum USBDeviceOpenError: Error, CustomStringConvertible, LocalizedError, Equatable {
+    public var errorDescription: String? { description }
+
     case notFound(busid: String)
     /// macOS drivers hold the device, and only root may take it from them.
     case captureNeedsRoot(busid: String, holders: [String])
@@ -176,15 +178,24 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
 
         guard let configuration = device.configurationDescriptor else { return }
         let expected = Int(configuration.pointee.bNumInterfaces)
+        let value = configuration.pointee.bConfigurationValue
 
         // Interfaces appear as the configuration is applied, so give them a moment.
-        var services = Self.interfaceServices(under: service)
-        var waited = 0
-        while services.count < expected && waited < 20 {
+        var services = waitForInterfaces(of: service, expected: expected)
+
+        // A capture terminates every client of the device. If that took the interfaces
+        // with it, select the configuration again to have them made anew, unmatched.
+        if services.count < expected && captured {
             services.forEach { IOObjectRelease($0) }
-            Thread.sleep(forTimeInterval: 0.1)
-            waited += 1
-            services = Self.interfaceServices(under: service)
+            logger.info("\(busid) lost its interfaces to the capture; selecting configuration \(value) again")
+            try? device.__configure(withValue: 0, matchInterfaces: false)
+            do {
+                try device.__configure(withValue: Int(value), matchInterfaces: false)
+            } catch {
+                throw USBDeviceOpenError.openFailed(busid: busid, operation: "Reconfiguring the device",
+                                                    result: ioReturn(from: error))
+            }
+            services = waitForInterfaces(of: service, expected: expected)
         }
         defer { services.forEach { IOObjectRelease($0) } }
 
@@ -228,6 +239,20 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             alternates[number] = alternate
             addEndpointsLocked(of: interface, number: number, alternate: alternate)
         }
+    }
+
+    /// The device's interface services once `expected` of them exist, or whatever exists
+    /// after two seconds. The caller releases them.
+    private func waitForInterfaces(of service: io_service_t, expected: Int) -> [io_service_t] {
+        var services = Self.interfaceServices(under: service)
+        var waited = 0
+        while services.count < expected && waited < 20 {
+            services.forEach { IOObjectRelease($0) }
+            Thread.sleep(forTimeInterval: 0.1)
+            waited += 1
+            services = Self.interfaceServices(under: service)
+        }
+        return services
     }
 
     /// Make the pipes of one interface's alternate setting available. Called with the
@@ -299,7 +324,8 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
                                completion: @escaping @Sendable (IOReturn, Int) -> Void) throws {
         do {
             // No timeout: a client that gives up on a request cancels it with UNLINK.
-            try device.__enqueue(Self.request(setup), data: data, completionTimeout: 0) { status, transferred in
+            try owner(of: setup).__enqueue(Self.request(setup), data: data, completionTimeout: 0) {
+                status, transferred in
                 completion(status, transferred)
             }
         } catch {
@@ -310,11 +336,32 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     public func sendControl(_ setup: USBSetupPacket, data: NSMutableData?) throws -> Int {
         var transferred = 0
         do {
-            try device.__send(Self.request(setup), data: data, bytesTransferred: &transferred, completionTimeout: 5)
+            try owner(of: setup).__send(Self.request(setup), data: data, bytesTransferred: &transferred,
+                                        completionTimeout: 5)
         } catch {
             throw USBDeviceIOError(ioReturn(from: error), "Control request")
         }
         return transferred
+    }
+
+    /// The object to send a control request through: the interface it is addressed to,
+    /// or the interface owning the endpoint it is addressed to, as a driver would send
+    /// it; otherwise the device.
+    private func owner(of setup: USBSetupPacket) -> IOUSBHostObject {
+        let target = UInt8(truncatingIfNeeded: setup.wIndex)
+        lock.lock()
+        defer { lock.unlock() }
+        switch setup.bmRequestType & 0x1F {
+        case 0x01:
+            return interfaces[target] ?? device
+        case 0x02:
+            if let number = endpoints[target]?.interfaceNumber, let interface = interfaces[number] {
+                return interface
+            }
+            return device
+        default:
+            return device
+        }
     }
 
     public func enqueueTransfer(endpoint: UInt8, data: NSMutableData?,
@@ -369,10 +416,16 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     }
 
     public func abortControl() {
-        do {
-            try device.__abortDeviceRequests(with: .asynchronous)
-        } catch {
-            logger.debug("Aborting control requests: \(ioReturn(from: error))")
+        // Requests to an interface went through that interface's object.
+        lock.lock()
+        let owners: [IOUSBHostObject] = [device] + Array(interfaces.values)
+        lock.unlock()
+        for owner in owners {
+            do {
+                try owner.__abortDeviceRequests(with: .asynchronous)
+            } catch {
+                logger.debug("Aborting control requests: \(ioReturn(from: error))")
+            }
         }
     }
 
@@ -414,6 +467,10 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         } catch {
             throw USBDeviceIOError(ioReturn(from: error), "Selecting configuration \(value)")
         }
+
+        // Configuration 0 is the unconfigured state: no interfaces to open, and opening
+        // them would configure the device again behind the client's back.
+        guard value != 0 else { return }
 
         do {
             try openInterfaces(of: service)

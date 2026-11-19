@@ -130,7 +130,9 @@ public protocol USBDeviceIO: AnyObject {
 }
 
 /// How the device layer refuses an operation, as an IOReturn.
-public struct USBDeviceIOError: Error, Equatable, CustomStringConvertible {
+public struct USBDeviceIOError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    public var errorDescription: String? { description }
+
     public let result: IOReturn
     public let operation: String
 
@@ -153,6 +155,7 @@ public enum USBIOReturn {
     public static let noDevice = IOReturn(bitPattern: 0xE000_02C0)
     public static let notResponding = IOReturn(bitPattern: 0xE000_02ED)
     public static let exclusiveAccess = IOReturn(bitPattern: 0xE000_02C5)
+    public static let notOpen = IOReturn(bitPattern: 0xE000_02CD)
     public static let notPermitted = IOReturn(bitPattern: 0xE000_02E2)
     public static let badArgument = IOReturn(bitPattern: 0xE000_02C2)
     public static let unsupported = IOReturn(bitPattern: 0xE000_02C7)
@@ -258,7 +261,10 @@ public enum USBIPTransferStatus {
         switch result {
         case USBIOReturn.success, USBIOReturn.underrun, USBIOReturn.pipeStalled,
              USBIOReturn.aborted, USBIOReturn.timeout, USBIOReturn.transactionTimeout,
-             USBIOReturn.noDevice:
+             USBIOReturn.noDevice,
+             // Refusals by the software, which never reached the bus.
+             USBIOReturn.badArgument, USBIOReturn.notPermitted, USBIOReturn.unsupported,
+             USBIOReturn.exclusiveAccess, USBIOReturn.notOpen:
             return false
         default:
             return true

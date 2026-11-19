@@ -6,7 +6,7 @@ import IOKit
 import Common
 
 /// Why an import was refused before the device was opened.
-public enum AttachmentError: Error, CustomStringConvertible, Equatable {
+public enum AttachmentError: Error, CustomStringConvertible, LocalizedError, Equatable {
     /// Another client has the device. A second capture would take it from that client.
     case alreadyAttached(String)
 
@@ -16,6 +16,8 @@ public enum AttachmentError: Error, CustomStringConvertible, Equatable {
             return "\(busid) is already attached by another client"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 /// URB transfer_flags a server has to act on (linux/usb.h).
@@ -49,8 +51,17 @@ public enum URBTransferFlags {
 ///   does: the client's view of addresses and ports is its own.
 ///
 /// A withdrawn request (CMD_UNLINK) is aborted at the device and answered by RET_UNLINK
-/// alone once it has completed, as Linux's server does. IOUSBHost aborts every request
-/// pending on the endpoint, so others caught up in it complete with ECONNRESET.
+/// alone once it has completed, as Linux's server does. IOUSBHost can only abort a whole
+/// endpoint, and resetting an endpoint aborts what is queued on it too, so an endpoint
+/// being aborted is drained: requests caught up in it that had transferred nothing are
+/// queued again, in order, together with any submitted meanwhile. On Linux those
+/// requests simply carry on, and drivers that see them fail with ECONNRESET take it
+/// as their own unlink and stop resubmitting.
+///
+/// Everything here runs on one serial queue: messages from the client, and completions,
+/// which IOUSBHost delivers elsewhere and which are moved onto it. So a reply can never
+/// overtake another reply it must follow — a RET_UNLINK saying "already completed" is
+/// only ever sent after that request's RET_SUBMIT.
 public final class USBIPAttachment: @unchecked Sendable {
     public let busid: String
 
@@ -58,31 +69,54 @@ public final class USBIPAttachment: @unchecked Sendable {
     private let maxTransferSize: Int
     private let send: @Sendable (Data) -> Void
     private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<Bool>()
     private let logger = Logger(subsystem: "com.usbipd.mac", category: "attachment")
 
-    /// Guards `inFlight` and `isClosed`. Completions arrive on the device's queue.
-    private let lock = NSLock()
+    // Confined to `queue`.
     private var inFlight: [UInt32: InFlightURB] = [:]
+    private var draining: [UInt8: Set<UInt32>] = [:]
     private var isClosed = false
+    private var lastGeneration: UInt64 = 0
+
+    private enum Stage {
+        /// Queued with the device.
+        case queued
+        /// Aborted with an endpoint having transferred nothing; queued again when the
+        /// endpoint has drained.
+        case awaitingResubmit
+        /// Arrived while its endpoint was draining; queued when it has.
+        case held
+    }
 
     private struct InFlightURB {
         let request: USBIPSubmitRequest
         /// Endpoint address with the direction bit; 0 for the control endpoint.
         let endpoint: UInt8
-        let isControl: Bool
+        let transferType: USBTransferType
+        var stage: Stage
+        /// Which time this request was queued. A request queued again after an abort
+        /// must not take a late completion from its earlier attempt as its own.
+        var generation: UInt64 = 0
         /// The CMD_UNLINK that withdrew this request, answered when it completes.
-        var unlinkSeqnum: UInt32?
+        var withdrawnBy: UInt32?
+        /// The buffer an IN reply's data is read from.
+        var buffer: NSMutableData?
+        /// An OUT followed by a zero-length packet whose data part has not completed.
+        var awaitingDataPart = false
+        /// The data part's byte count, once it has completed.
+        var dataPartTransferred: Int?
     }
 
     /// - Parameters:
     ///   - maxTransferSize: the largest transfer a client may request.
-    ///   - send: delivers a reply to the client. Called from several queues.
+    ///   - send: delivers a reply to the client.
     public init(busid: String, io: USBDeviceIO, maxTransferSize: Int, send: @escaping @Sendable (Data) -> Void) {
         self.busid = busid
         self.io = io
         self.maxTransferSize = maxTransferSize
         self.send = send
         self.queue = DispatchQueue(label: "com.usbipd.mac.attachment.\(busid)")
+        queue.setSpecific(key: queueKey, value: true)
     }
 
     /// Handle one framed CMD_SUBMIT or CMD_UNLINK. Messages must be passed in the order
@@ -91,39 +125,38 @@ public final class USBIPAttachment: @unchecked Sendable {
         queue.async { self.process(message) }
     }
 
-    /// Stop serving: abort what is in flight and give the device back to macOS.
+    /// Stop serving: abort what is in flight and give the device back to macOS. Returns
+    /// once the device has been given back.
     public func close() {
-        lock.lock()
-        let wasClosed = isClosed
-        isClosed = true
-        inFlight.removeAll()
-        lock.unlock()
-        guard !wasClosed else { return }
-
-        queue.async {
+        let work = {
+            guard !self.isClosed else { return }
+            self.isClosed = true
+            // The device first: its aborts complete what is in flight before the
+            // buffers those transfers use are let go.
             self.io.close()
+            self.inFlight.removeAll()
+            self.draining.removeAll()
+        }
+        if DispatchQueue.getSpecific(key: queueKey) == true {
+            work()
+        } else {
+            queue.sync(execute: work)
         }
     }
 
-    /// Wait until every message handed to `handle` so far has been processed. Requests
-    /// queued with the device may still be in flight.
+    /// Wait until every message and completion handed over so far has been processed.
     func waitUntilProcessed() {
         queue.sync {}
     }
 
     var inFlightCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return inFlight.count
+        return queue.sync { inFlight.count }
     }
 
     // MARK: - Dispatch
 
     private func process(_ message: Data) {
-        lock.lock()
-        let closed = isClosed
-        lock.unlock()
-        guard !closed else { return }
+        guard !isClosed else { return }
 
         guard let header = try? USBIPBasicHeader.decode(from: message) else {
             logger.warning("Ignoring a message with an unreadable header")
@@ -145,8 +178,8 @@ public final class USBIPAttachment: @unchecked Sendable {
         do {
             request = try USBIPSubmitRequest.decode(from: message)
         } catch {
-            reply(seqnum: header.seqnum, devid: header.devid, direction: header.direction, ep: header.ep,
-                  status: -LinuxErrno.einval)
+            deliver(USBIPSubmitResponse(seqnum: header.seqnum, devid: header.devid, direction: header.direction,
+                                        ep: header.ep, status: -LinuxErrno.einval, actualLength: 0))
             return
         }
 
@@ -157,11 +190,43 @@ public final class USBIPAttachment: @unchecked Sendable {
         }
 
         let number = UInt8(truncatingIfNeeded: request.ep & 0x0F)
-        if number == 0 {
+        guard number != 0 else {
             submitControl(request)
-        } else {
-            let inbound = request.direction == USBIPProtocol.directionIn
-            submitEndpoint(request, address: inbound ? number | 0x80 : number)
+            return
+        }
+
+        let inbound = request.direction == USBIPProtocol.directionIn
+        let address = inbound ? number | 0x80 : number
+        guard let endpoint = io.endpoint(address) else {
+            // Not in the current configuration and alternate settings. ENOENT is what
+            // Linux's usb_submit_urb returns for that.
+            reply(to: request, status: -LinuxErrno.enoent)
+            return
+        }
+
+        switch endpoint.transferType {
+        case .control:
+            reply(to: request, status: -LinuxErrno.einval)
+        case .isochronous:
+            // The packets are checked now, so a request that cannot be laid out is
+            // refused before anything is queued.
+            guard isochronousLength(of: request) != nil else {
+                reply(to: request, status: -LinuxErrno.einval)
+                return
+            }
+            admit(request, endpoint: address, transferType: .isochronous)
+        case .bulk, .interrupt:
+            admit(request, endpoint: address, transferType: endpoint.transferType)
+        }
+    }
+
+    /// Track a request and queue it, or hold it while its endpoint drains.
+    private func admit(_ request: USBIPSubmitRequest, endpoint: UInt8, transferType: USBTransferType) {
+        let draining = self.draining[endpoint] != nil
+        inFlight[request.seqnum] = InFlightURB(request: request, endpoint: endpoint, transferType: transferType,
+                                               stage: draining ? .held : .queued)
+        if !draining {
+            start(request.seqnum)
         }
     }
 
@@ -177,27 +242,7 @@ public final class USBIPAttachment: @unchecked Sendable {
             reply(to: request, status: status)
             return
         }
-
-        let inbound = setup.isDeviceToHost
-        let buffer: NSMutableData?
-        if inbound {
-            buffer = setup.wLength > 0 ? io.makeBuffer(length: Int(setup.wLength)) : nil
-        } else if let payload = request.transferBuffer, !payload.isEmpty {
-            buffer = NSMutableData(data: payload)
-        } else {
-            buffer = nil
-        }
-
-        track(request, endpoint: 0, isControl: true)
-        let replyBuffer = ReplyBuffer(inbound ? buffer : nil)
-        do {
-            try io.enqueueControl(setup, data: buffer) { [weak self] result, transferred in
-                self?.complete(request.seqnum, result: result, transferred: transferred, buffer: replyBuffer.data)
-            }
-        } catch {
-            untrack(request.seqnum)
-            reply(to: request, status: USBIPTransferStatus.urbStatus(for: ioReturn(from: error)))
-        }
+        admit(request, endpoint: 0, transferType: .control)
     }
 
     /// Carry out a request that changes the host's state, returning its status, or nil if
@@ -227,11 +272,7 @@ public final class USBIPAttachment: @unchecked Sendable {
             if let failure = status({ _ = try io.sendControl(setup, data: nil) }), failure != 0 {
                 return failure
             }
-            do {
-                try io.clearHalt(endpoint: endpoint)
-            } catch {
-                logger.debug("Host side of \(String(format: "0x%02x", endpoint)) not cleared: \(error)")
-            }
+            resetHostSide(of: endpoint)
             return 0
 
         case (0x23, 0x03) where setup.wValue == 4:
@@ -253,98 +294,112 @@ public final class USBIPAttachment: @unchecked Sendable {
         }
     }
 
-    // MARK: - Other endpoints
+    // MARK: - Queueing with the device
 
-    private func submitEndpoint(_ request: USBIPSubmitRequest, address: UInt8) {
-        guard let endpoint = io.endpoint(address) else {
-            // Not in the current configuration and alternate settings. ENOENT is what
-            // Linux's usb_submit_urb returns for that.
-            reply(to: request, status: -LinuxErrno.enoent)
-            return
-        }
+    /// Queue a tracked request with the device. Buffers are made here rather than on
+    /// arrival, so a request queued again after an abort starts from its original data.
+    private func start(_ seqnum: UInt32) {
+        guard var entry = inFlight[seqnum] else { return }
+        let request = entry.request
+        lastGeneration += 1
+        entry.generation = lastGeneration
+        let generation = lastGeneration
 
-        switch endpoint.transferType {
-        case .bulk, .interrupt:
-            submitTransfer(request, endpoint: endpoint)
-        case .isochronous:
-            submitIsochronous(request, endpoint: endpoint)
-        case .control:
-            reply(to: request, status: -LinuxErrno.einval)
+        do {
+            switch entry.transferType {
+            case .control:
+                guard let setup = USBSetupPacket(request.setup) else { throw USBDeviceIOError(USBIOReturn.badArgument, "Setup") }
+                let buffer: NSMutableData?
+                if setup.isDeviceToHost {
+                    buffer = setup.wLength > 0 ? io.makeBuffer(length: Int(setup.wLength)) : nil
+                    entry.buffer = buffer
+                } else if let payload = request.transferBuffer, !payload.isEmpty {
+                    buffer = NSMutableData(data: payload)
+                } else {
+                    buffer = nil
+                }
+                inFlight[seqnum] = entry
+                try io.enqueueControl(setup, data: buffer) { [weak self] result, transferred in
+                    self?.queue.async {
+                        self?.completed(seqnum, generation: generation, result: result, transferred: transferred)
+                    }
+                }
+
+            case .bulk, .interrupt:
+                try startTransfer(seqnum, generation: generation, entry: &entry)
+
+            case .isochronous:
+                try startIsochronous(seqnum, generation: generation, entry: &entry)
+            }
+        } catch {
+            inFlight[seqnum] = nil
+            reply(to: request, status: USBIPTransferStatus.urbStatus(for: ioReturn(from: error)))
         }
     }
 
-    private func submitTransfer(_ request: USBIPSubmitRequest, endpoint: USBEndpointInfo) {
-        let address = endpoint.address
+    private func startTransfer(_ seqnum: UInt32, generation: UInt64, entry: inout InFlightURB) throws {
+        let request = entry.request
+        let address = entry.endpoint
         let inbound = address & 0x80 != 0
         let length = Int(request.transferBufferLength)
 
         let buffer: NSMutableData?
         if inbound {
             buffer = length > 0 ? io.makeBuffer(length: length) : nil
+            entry.buffer = buffer
         } else if let payload = request.transferBuffer, !payload.isEmpty {
             buffer = outBuffer(payload)
         } else {
             buffer = nil
         }
 
+        let packetSize = io.endpoint(address)?.maxPacketSize ?? 0
         let zeroPacket = !inbound && request.transferFlags & URBTransferFlags.zeroPacket != 0
-            && length > 0 && endpoint.maxPacketSize > 0 && length % endpoint.maxPacketSize == 0
+            && length > 0 && packetSize > 0 && length % packetSize == 0
+        entry.awaitingDataPart = zeroPacket
+        inFlight[seqnum] = entry
 
-        track(request, endpoint: address, isControl: false)
-        do {
-            if zeroPacket {
-                // Both are queued now so nothing queued later can come between them.
-                let first = TransferResultBox()
-                try io.enqueueTransfer(endpoint: address, data: buffer) { result, transferred in
-                    first.store(result, transferred)
-                }
-                try io.enqueueTransfer(endpoint: address, data: nil) { [weak self] result, _ in
-                    let (firstResult, transferred) = first.load()
-                    self?.complete(request.seqnum, result: firstResult == kIOReturnSuccess ? result : firstResult,
-                                   transferred: transferred, buffer: nil)
-                }
-            } else {
-                let replyBuffer = ReplyBuffer(inbound ? buffer : nil)
-                try io.enqueueTransfer(endpoint: address, data: buffer) { [weak self] result, transferred in
-                    self?.complete(request.seqnum, result: result, transferred: transferred, buffer: replyBuffer.data)
+        try io.enqueueTransfer(endpoint: address, data: buffer) { [weak self] result, transferred in
+            self?.queue.async {
+                self?.completed(seqnum, generation: generation, result: result, transferred: transferred)
+            }
+        }
+        if zeroPacket {
+            // Queued straight after the data, so nothing queued later can come between.
+            try io.enqueueTransfer(endpoint: address, data: nil) { [weak self] result, transferred in
+                self?.queue.async {
+                    self?.completed(seqnum, generation: generation, result: result, transferred: transferred)
                 }
             }
-        } catch {
-            untrack(request.seqnum)
-            reply(to: request, status: USBIPTransferStatus.urbStatus(for: ioReturn(from: error)))
         }
     }
 
-    private func submitIsochronous(_ request: USBIPSubmitRequest, endpoint: USBEndpointInfo) {
-        let packets = request.isoPackets
-        guard !packets.isEmpty else {
-            reply(to: request, status: -LinuxErrno.einval)
-            return
+    private func startIsochronous(_ seqnum: UInt32, generation: UInt64, entry: inout InFlightURB) throws {
+        let request = entry.request
+        let inbound = entry.endpoint & 0x80 != 0
+        guard let total = isochronousLength(of: request) else {
+            throw USBDeviceIOError(USBIOReturn.badArgument, "Isochronous packets")
         }
-        let inbound = endpoint.address & 0x80 != 0
 
         // The packets go back to back in the device's buffer. The client's offsets can
         // leave gaps, and the reply's data is back to back anyway.
         var transactions: [USBIsochronousTransaction] = []
-        var total = 0
-        for packet in packets {
-            transactions.append(USBIsochronousTransaction(requestCount: packet.length, offset: UInt32(total)))
-            total += Int(packet.length)
-        }
-        guard total <= maxTransferSize else {
-            reply(to: request, status: -LinuxErrno.einval)
-            return
+        var offset = 0
+        for packet in request.isoPackets {
+            transactions.append(USBIsochronousTransaction(requestCount: packet.length, offset: UInt32(offset)))
+            offset += Int(packet.length)
         }
 
         let buffer = io.makeBuffer(length: total)
-        if !inbound {
+        if inbound {
+            entry.buffer = buffer
+        } else {
             let payload = request.transferBuffer ?? Data()
-            for (packet, transaction) in zip(packets, transactions) where packet.length > 0 {
+            for (packet, transaction) in zip(request.isoPackets, transactions) where packet.length > 0 {
                 let start = Int(packet.offset)
                 let end = start + Int(packet.length)
                 guard end <= payload.count else {
-                    reply(to: request, status: -LinuxErrno.einval)
-                    return
+                    throw USBDeviceIOError(USBIOReturn.badArgument, "Isochronous packet outside the data")
                 }
                 payload.withUnsafeBytes { source in
                     let destination = buffer.mutableBytes.advanced(by: Int(transaction.offset))
@@ -352,19 +407,29 @@ public final class USBIPAttachment: @unchecked Sendable {
                 }
             }
         }
+        inFlight[seqnum] = entry
 
-        track(request, endpoint: endpoint.address, isControl: false)
-        let replyBuffer = ReplyBuffer(inbound ? buffer : nil)
-        do {
-            try io.enqueueIsochronous(endpoint: endpoint.address, data: buffer, transactions: transactions) {
-                [weak self] result, completed in
-                self?.completeIsochronous(request.seqnum, result: result, completed: completed,
-                                          buffer: replyBuffer.data)
+        try io.enqueueIsochronous(endpoint: entry.endpoint, data: buffer, transactions: transactions) {
+            [weak self] result, completed in
+            self?.queue.async {
+                self?.completedIsochronous(seqnum, generation: generation, result: result, completed: completed)
             }
-        } catch {
-            untrack(request.seqnum)
-            reply(to: request, status: USBIPTransferStatus.urbStatus(for: ioReturn(from: error)))
         }
+    }
+
+    /// Total bytes of an isochronous request's packets, or nil if there are none or they
+    /// exceed what a transfer may be. Summed without overflow: three packets of
+    /// 0xffffffff bytes must be refused, not trap.
+    private func isochronousLength(of request: USBIPSubmitRequest) -> Int? {
+        guard !request.isoPackets.isEmpty else { return nil }
+        var total = 0
+        for packet in request.isoPackets {
+            total += Int(packet.length)
+            if total > maxTransferSize {
+                return nil
+            }
+        }
+        return total
     }
 
     private func outBuffer(_ payload: Data) -> NSMutableData {
@@ -375,65 +440,155 @@ public final class USBIPAttachment: @unchecked Sendable {
         return buffer
     }
 
-    // MARK: - Withdrawing requests
+    // MARK: - Withdrawing requests and draining endpoints
 
     private func unlink(_ message: Data) {
         guard let request = try? USBIPUnlinkRequest.decode(from: message) else { return }
 
-        lock.lock()
-        guard var entry = inFlight[request.unlinkSeqnum], entry.unlinkSeqnum == nil else {
-            lock.unlock()
-            // Already answered. Linux's server says so with status 0, and the client
-            // has its RET_SUBMIT.
+        guard var entry = inFlight[request.unlinkSeqnum], entry.withdrawnBy == nil else {
+            // Already answered. Linux's server says so with status 0; the RET_SUBMIT
+            // went out before this, from this same queue.
             sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: 0)
             return
         }
-        entry.unlinkSeqnum = request.seqnum
-        inFlight[request.unlinkSeqnum] = entry
-        lock.unlock()
 
-        // The reply goes out when the aborted request completes.
-        if entry.isControl {
-            io.abortControl()
-        } else {
-            io.abort(endpoint: entry.endpoint)
+        switch entry.stage {
+        case .held, .awaitingResubmit:
+            // Not with the device: nothing to abort.
+            inFlight[request.unlinkSeqnum] = nil
+            sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: -LinuxErrno.econnreset)
+
+        case .queued:
+            entry.withdrawnBy = request.seqnum
+            inFlight[request.unlinkSeqnum] = entry
+            // The reply goes out when the aborted request completes.
+            if beginDraining(entry.endpoint) {
+                if entry.endpoint == 0 {
+                    io.abortControl()
+                } else {
+                    io.abort(endpoint: entry.endpoint)
+                }
+            }
+        }
+    }
+
+    /// Start draining an endpoint about to be aborted or reset. Returns false when it is
+    /// already draining, in which case the abort that started it covers this request too.
+    private func beginDraining(_ endpoint: UInt8) -> Bool {
+        guard draining[endpoint] == nil else { return false }
+        let outstanding = inFlight.filter { $0.value.endpoint == endpoint && $0.value.stage == .queued }.keys
+        draining[endpoint] = Set(outstanding)
+        if outstanding.isEmpty {
+            finishDraining(endpoint)
+        }
+        return true
+    }
+
+    /// Clear the host's side of an endpoint, which aborts what is queued on it.
+    private func resetHostSide(of endpoint: UInt8) {
+        let started = beginDraining(endpoint)
+        do {
+            try io.clearHalt(endpoint: endpoint)
+        } catch {
+            logger.debug("Host side of \(String(format: "0x%02x", endpoint)) not cleared: \(error)")
+        }
+        if started {
+            finishDraining(endpoint)
+        }
+    }
+
+    /// Once nothing aborted is left outstanding on an endpoint, queue again what the abort
+    /// caught and what arrived meanwhile, in the order the client sent it.
+    private func finishDraining(_ endpoint: UInt8) {
+        guard let outstanding = draining[endpoint], outstanding.isEmpty else { return }
+        draining[endpoint] = nil
+
+        let waiting = inFlight.filter {
+            $0.value.endpoint == endpoint && ($0.value.stage == .awaitingResubmit || $0.value.stage == .held)
+        }.keys.sorted()
+        for seqnum in waiting {
+            guard var entry = inFlight[seqnum] else { continue }
+            entry.stage = .queued
+            entry.awaitingDataPart = false
+            entry.dataPartTransferred = nil
+            inFlight[seqnum] = entry
+            start(seqnum)
         }
     }
 
     // MARK: - Completion
 
-    private func track(_ request: USBIPSubmitRequest, endpoint: UInt8, isControl: Bool) {
-        lock.lock()
-        inFlight[request.seqnum] = InFlightURB(request: request, endpoint: endpoint, isControl: isControl)
-        lock.unlock()
-    }
+    private func completed(_ seqnum: UInt32, generation: UInt64, result: IOReturn, transferred: Int) {
+        // A completion from an earlier attempt, or from the zero-length packet of one
+        // already set aside to be queued again, belongs to nothing current.
+        guard !isClosed, var entry = inFlight[seqnum], entry.generation == generation,
+              entry.stage == .queued else { return }
 
-    private func untrack(_ seqnum: UInt32) {
-        lock.lock()
-        inFlight[seqnum] = nil
-        lock.unlock()
-    }
-
-    /// Take a completed request out of the table. Returns nil when the attachment is
-    /// closed or the request was withdrawn (whose RET_UNLINK this sends).
-    private func finish(_ seqnum: UInt32) -> InFlightURB? {
-        lock.lock()
-        let entry = inFlight.removeValue(forKey: seqnum)
-        let closed = isClosed
-        lock.unlock()
-
-        guard let entry = entry, !closed else { return nil }
-        if let unlinkSeqnum = entry.unlinkSeqnum {
-            sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
-            return nil
+        // An OUT with a zero-length packet completes twice. A data part that succeeds
+        // waits for the packet; one that fails is answered at once, since the packet
+        // behind it will sit on a halted endpoint until the client clears it.
+        if entry.awaitingDataPart {
+            entry.awaitingDataPart = false
+            if result == kIOReturnSuccess {
+                entry.dataPartTransferred = transferred
+                inFlight[seqnum] = entry
+                return
+            }
         }
-        return entry
+        let wasDraining = leaveDrain(seqnum, endpoint: entry.endpoint)
+        inFlight[seqnum] = nil
+
+        if let unlinkSeqnum = entry.withdrawnBy {
+            sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
+        } else if result == USBIOReturn.aborted && wasDraining && transferred == 0 && entry.dataPartTransferred == nil {
+            // Caught up in another request's abort, with nothing transferred: queued
+            // again once the endpoint has drained.
+            entry.stage = .awaitingResubmit
+            inFlight[seqnum] = entry
+        } else {
+            // A zero-length packet aborted after its data went out completes as a success.
+            let dataDone = entry.dataPartTransferred
+            let finalResult = dataDone != nil && result == USBIOReturn.aborted ? kIOReturnSuccess : result
+            reply(to: entry, result: finalResult, transferred: dataDone ?? transferred)
+
+            if entry.transferType != .control && USBIPTransferStatus.needsHostSideReset(after: result) {
+                resetHostSide(of: entry.endpoint)
+            }
+        }
+        finishDraining(entry.endpoint)
     }
 
-    private func complete(_ seqnum: UInt32, result: IOReturn, transferred: Int, buffer: NSMutableData?) {
-        guard let entry = finish(seqnum) else { return }
-        let request = entry.request
+    private func completedIsochronous(_ seqnum: UInt32, generation: UInt64, result: IOReturn,
+                                      completed: [USBIsochronousTransaction]) {
+        guard !isClosed, var entry = inFlight[seqnum], entry.generation == generation,
+              entry.stage == .queued else { return }
+        let wasDraining = leaveDrain(seqnum, endpoint: entry.endpoint)
+        inFlight[seqnum] = nil
 
+        let transferredAny = completed.contains { $0.completeCount > 0 }
+        if let unlinkSeqnum = entry.withdrawnBy {
+            sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
+        } else if result == USBIOReturn.aborted && wasDraining && !transferredAny {
+            entry.stage = .awaitingResubmit
+            inFlight[seqnum] = entry
+        } else {
+            replyIsochronous(to: entry, result: result, completed: completed)
+        }
+        finishDraining(entry.endpoint)
+    }
+
+    /// Take a completed request off its endpoint's drain. Returns whether it was on one.
+    private func leaveDrain(_ seqnum: UInt32, endpoint: UInt8) -> Bool {
+        guard var outstanding = draining[endpoint], outstanding.contains(seqnum) else { return false }
+        outstanding.remove(seqnum)
+        draining[endpoint] = outstanding
+        return true
+    }
+
+    // MARK: - Replies
+
+    private func reply(to entry: InFlightURB, result: IOReturn, transferred: Int) {
+        let request = entry.request
         var status = USBIPTransferStatus.urbStatus(for: result)
         let inbound = request.direction == USBIPProtocol.directionIn
         if status == 0, inbound, request.transferFlags & URBTransferFlags.shortNotOK != 0,
@@ -441,26 +596,15 @@ public final class USBIPAttachment: @unchecked Sendable {
             status = -LinuxErrno.eremoteio
         }
 
-        if !entry.isControl && USBIPTransferStatus.needsHostSideReset(after: result) {
-            // Cleared from the attachment's queue: clearing aborts what is pending on
-            // the endpoint, and doing that from inside a completion could wait on this
-            // very queue.
-            let endpoint = entry.endpoint
-            queue.async { [io] in try? io.clearHalt(endpoint: endpoint) }
-        }
-
         var data: Data?
-        if let buffer = buffer, transferred > 0 {
+        if let buffer = entry.buffer, transferred > 0 {
             data = Data(bytes: buffer.bytes, count: min(transferred, buffer.length))
         }
-        reply(to: request, status: status, actualLength: UInt32(transferred), data: data)
+        reply(to: request, status: status, actualLength: UInt32(clamping: transferred), data: data)
     }
 
-    private func completeIsochronous(_ seqnum: UInt32, result: IOReturn, completed: [USBIsochronousTransaction],
-                                     buffer: NSMutableData?) {
-        guard let entry = finish(seqnum) else { return }
+    private func replyIsochronous(to entry: InFlightURB, result: IOReturn, completed: [USBIsochronousTransaction]) {
         let request = entry.request
-
         var descriptors: [USBIPIsoPacketDescriptor] = []
         var data = Data()
         var actual: UInt32 = 0
@@ -473,7 +617,7 @@ public final class USBIPAttachment: @unchecked Sendable {
             if status != 0 {
                 errors += 1
             }
-            if let buffer = buffer, count > 0, Int(transaction.offset) + Int(count) <= buffer.length {
+            if let buffer = entry.buffer, count > 0, Int(transaction.offset) + Int(count) <= buffer.length {
                 data.append(buffer.bytes.advanced(by: Int(transaction.offset)).assumingMemoryBound(to: UInt8.self),
                             count: Int(count))
             }
@@ -489,31 +633,22 @@ public final class USBIPAttachment: @unchecked Sendable {
             || Int(errors) < request.isoPackets.count
         let status = ranAtAll ? 0 : USBIPTransferStatus.urbStatus(for: result)
 
-        let response = USBIPSubmitResponse(
+        deliver(USBIPSubmitResponse(
             seqnum: request.seqnum, devid: request.devid, direction: request.direction, ep: request.ep,
             status: status, actualLength: actual, startFrame: request.startFrame,
             numberOfPackets: UInt32(request.isoPackets.count), errorCount: errors,
-            transferBuffer: buffer == nil || data.isEmpty ? nil : data, isoPackets: descriptors)
-        deliver(response)
+            transferBuffer: entry.buffer == nil || data.isEmpty ? nil : data, isoPackets: descriptors))
     }
 
-    // MARK: - Replies
-
     private func reply(to request: USBIPSubmitRequest, status: Int32, actualLength: UInt32 = 0, data: Data? = nil) {
-        let response = USBIPSubmitResponse(
+        deliver(USBIPSubmitResponse(
             seqnum: request.seqnum, devid: request.devid, direction: request.direction, ep: request.ep,
             status: status, actualLength: actualLength, startFrame: request.startFrame,
             numberOfPackets: request.isoPackets.isEmpty ? 0 : UInt32(request.isoPackets.count),
             errorCount: 0, transferBuffer: data,
             isoPackets: request.isoPackets.map {
                 USBIPIsoPacketDescriptor(offset: $0.offset, length: $0.length, actualLength: 0, status: status)
-            })
-        deliver(response)
-    }
-
-    private func reply(seqnum: UInt32, devid: UInt32, direction: UInt32, ep: UInt32, status: Int32) {
-        deliver(USBIPSubmitResponse(seqnum: seqnum, devid: devid, direction: direction, ep: ep,
-                                    status: status, actualLength: 0))
+            }))
     }
 
     private func sendUnlinkReply(seqnum: UInt32, devid: UInt32, status: Int32) {
@@ -529,35 +664,5 @@ public final class USBIPAttachment: @unchecked Sendable {
         } catch {
             logger.error("Could not encode a reply for seqnum \(response.seqnum): \(error)")
         }
-    }
-}
-
-/// Hands an IN transfer's buffer to its completion, which IOUSBHost calls on another
-/// queue. Nothing touches the buffer between the two.
-private final class ReplyBuffer: @unchecked Sendable {
-    let data: NSMutableData?
-
-    init(_ data: NSMutableData?) {
-        self.data = data
-    }
-}
-
-/// Carries the first transfer's result to the zero-length packet queued after it.
-private final class TransferResultBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var result: IOReturn = kIOReturnSuccess
-    private var transferred = 0
-
-    func store(_ result: IOReturn, _ transferred: Int) {
-        lock.lock()
-        self.result = result
-        self.transferred = transferred
-        lock.unlock()
-    }
-
-    func load() -> (IOReturn, Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (result, transferred)
     }
 }

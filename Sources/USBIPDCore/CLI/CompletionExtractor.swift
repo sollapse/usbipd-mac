@@ -117,6 +117,31 @@ public class CompletionExtractor {
                 )
             ]
             
+        case "kext":
+            return [
+                CompletionOption(
+                    short: "o",
+                    long: "output",
+                    description: "Directory to write usbipd-claim.kext into",
+                    takesValue: true,
+                    valueType: .directory
+                ),
+                CompletionOption(
+                    short: nil,
+                    long: "no-sign",
+                    description: "Leave the kext unsigned",
+                    takesValue: false,
+                    valueType: .none
+                ),
+                CompletionOption(
+                    short: "h",
+                    long: "help",
+                    description: "Show help message",
+                    takesValue: false,
+                    valueType: .none
+                )
+            ]
+
         case "daemon":
             return [
                 CompletionOption(
@@ -172,7 +197,7 @@ public class CompletionExtractor {
     /// - Returns: Array of CompletionArgument instances
     private func extractCommandArguments(from command: CompletableCommand) -> [CompletionArgument] {
         switch command.name {
-        case "bind", "unbind":
+        case "bind", "unbind", "probe", "kext":
             return [
                 CompletionArgument(
                     name: "busid",
