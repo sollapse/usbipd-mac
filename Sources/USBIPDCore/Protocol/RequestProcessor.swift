@@ -43,6 +43,12 @@ public final class USBIPConnectionState {
         return _phase
     }
 
+    /// Whether the connection carries URB traffic, which decides how its bytes are framed.
+    public var isAttached: Bool {
+        if case .attached = phase { return true }
+        return false
+    }
+
     /// Called once OP_REP_IMPORT has been sent successfully.
     public func markAttached(busID: String) {
         lock.lock(); defer { lock.unlock() }

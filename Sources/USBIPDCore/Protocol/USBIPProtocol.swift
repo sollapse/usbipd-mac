@@ -16,6 +16,10 @@ public enum USBIPProtocol {
     /// Kept in one place because these sizes were previously duplicated as literals
     /// across encode, decode and validation, and drifted apart.
     public static let commandMessagePrefixSize = 48
+
+    /// `direction` values in usbip_header_basic (USBIP_DIR_OUT, USBIP_DIR_IN).
+    public static let directionOut: UInt32 = 0
+    public static let directionIn: UInt32 = 1
     
     /// USB/IP message identifiers used for dispatch within this codebase.
     ///

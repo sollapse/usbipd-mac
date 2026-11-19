@@ -420,80 +420,40 @@ public class ServerCoordinator: USBIPServer {
             // successful import this socket switches from op_common to
             // usbip_header_basic, and nothing in the bytes says so.
             let connectionState = USBIPConnectionState()
-            
-            // Set up data handler for the connection with concurrent processing
+
+            // TCP delivers bytes, not messages: one read can hold part of a message or
+            // several of them. See USBIPStreamFramer.
+            var framer = USBIPStreamFramer()
+
+            // Reads are delivered one at a time on the connection's own queue, so the
+            // framer is only ever touched from one thread.
             connection.onDataReceived = { [weak self] data in
                 guard let self = self else { return }
-                
+
                 self.logger.debug("Received data from client", context: [
                     "connectionId": connection.id.uuidString,
                     "dataSize": data.count
                 ])
-                
-                // Check if this connection has reached its concurrent request limit
-                let activeCount = self.activeRequests.getActiveRequestCount(for: connection.id)
-                if activeCount >= self.maxConcurrentRequestsPerClient {
-                    self.logger.warning("Client connection reached concurrent request limit", context: [
-                        "connectionId": connection.id.uuidString,
-                        "activeRequests": activeCount,
-                        "limit": self.maxConcurrentRequestsPerClient
-                    ])
-                    // Could send error response or drop request
-                    return
-                }
-                
-                // Increment active request count
-                self.activeRequests.incrementActiveRequests(for: connection.id)
-                
-                // Process request concurrently
-                self.requestProcessingQueue.async {
-                    defer {
-                        // Always decrement active request count when done
-                        self.activeRequests.decrementActiveRequests(for: connection.id)
-                    }
-                    
-                    do {
-                        // Process the request using the request processor
-                        let responseData = try self.requestProcessor.processRequest(
-                            data, connectionState: connectionState)
-                        
-                        // An empty response means the processor deliberately has nothing
-                        // to say — a request the client withdrew, which is answered by
-                        // its RET_UNLINK and must not also draw a RET_SUBMIT. Writing
-                        // zero bytes would be harmless but the intent is worth stating.
-                        if !responseData.isEmpty {
-                            // Send the response back to the client (this must be thread-safe)
-                            try connection.send(data: responseData)
-                        }
 
-                        // Once the socket carries an attached device it may go quiet
-                        // indefinitely, so exempt it from the idle reaper.
-                        if case .attached = connectionState.phase,
-                           let tcpConnection = connection as? TCPClientConnection {
-                            tcpConnection.keepAlive = true
-                        }
-                        
-                        self.logger.debug("Sent response to client", context: [
-                            "connectionId": connection.id.uuidString,
-                            "responseSize": responseData.count
-                        ])
+                framer.append(data)
+                while true {
+                    let message: Data?
+                    do {
+                        message = try framer.nextMessage(attached: connectionState.isAttached)
                     } catch {
-                        self.logger.error("Failed to process request", context: [
+                        // The stream cannot be resynchronised once a header is
+                        // nonsense: everything after it would be read at the wrong
+                        // offsets.
+                        self.logger.warning("Closing connection on an unframeable message", context: [
                             "connectionId": connection.id.uuidString,
-                            "error": error.localizedDescription
+                            "error": String(describing: error)
                         ])
-                        
-                        // Forward error to server error handler
                         self.onError?(error)
-                        
-                        // Close the connection on critical errors
-                        if case USBIPProtocolError.invalidHeader = error {
-                            self.logger.warning("Closing connection due to invalid header", context: [
-                                "connectionId": connection.id.uuidString
-                            ])
-                            try? connection.close()
-                        }
+                        try? connection.close()
+                        return
                     }
+                    guard let message = message else { break }
+                    self.dispatch(message, from: connection, state: connectionState)
                 }
             }
             
@@ -550,6 +510,74 @@ public class ServerCoordinator: USBIPServer {
         }
     }
     
+    /// Handle one framed message.
+    ///
+    /// Handshake messages are processed before the next message is framed, because an
+    /// import changes how every byte after it is read. URB traffic goes to the
+    /// concurrent processing queue, so a read that blocks does not hold up the requests
+    /// behind it.
+    private func dispatch(_ message: Data, from connection: ClientConnection, state: USBIPConnectionState) {
+        guard state.isAttached else {
+            process(message, from: connection, state: state)
+            return
+        }
+
+        activeRequests.incrementActiveRequests(for: connection.id)
+        let activeCount = activeRequests.getActiveRequestCount(for: connection.id)
+        if activeCount > maxConcurrentRequestsPerClient {
+            // Reported, not enforced. Dropping the request, as this used to, left the
+            // client waiting for a reply that would never come.
+            logger.warning("Client connection is over its concurrent request limit", context: [
+                "connectionId": connection.id.uuidString,
+                "activeRequests": activeCount,
+                "limit": maxConcurrentRequestsPerClient
+            ])
+        }
+
+        requestProcessingQueue.async {
+            defer { self.activeRequests.decrementActiveRequests(for: connection.id) }
+            self.process(message, from: connection, state: state)
+        }
+    }
+
+    /// Run one message through the request processor and send its reply.
+    private func process(_ message: Data, from connection: ClientConnection, state: USBIPConnectionState) {
+        do {
+            let responseData = try requestProcessor.processRequest(message, connectionState: state)
+
+            // An empty response means the processor deliberately has nothing to say — a
+            // request the client withdrew, which is answered by its RET_UNLINK and must
+            // not also draw a RET_SUBMIT.
+            if !responseData.isEmpty {
+                try connection.send(data: responseData)
+            }
+
+            // Once the socket carries an attached device it may go quiet indefinitely,
+            // so exempt it from the idle reaper.
+            if state.isAttached, let tcpConnection = connection as? TCPClientConnection {
+                tcpConnection.keepAlive = true
+            }
+
+            logger.debug("Sent response to client", context: [
+                "connectionId": connection.id.uuidString,
+                "responseSize": responseData.count
+            ])
+        } catch {
+            logger.error("Failed to process request", context: [
+                "connectionId": connection.id.uuidString,
+                "error": error.localizedDescription
+            ])
+            onError?(error)
+
+            if case USBIPProtocolError.invalidHeader = error {
+                logger.warning("Closing connection due to invalid header", context: [
+                    "connectionId": connection.id.uuidString
+                ])
+                try? connection.close()
+            }
+        }
+    }
+
     /// Start the USB/IP server
     public func start() throws {
         guard !isServerRunning else {
