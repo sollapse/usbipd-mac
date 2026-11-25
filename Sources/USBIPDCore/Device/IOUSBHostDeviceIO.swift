@@ -26,11 +26,15 @@ public enum USBDeviceOpenError: Error, CustomStringConvertible, LocalizedError, 
     /// started from, the app among them being the one macOS asks about.
     case storageNeedsFullDiskAccess(busid: String, interface: UInt8, launchedFrom: [String])
     case openFailed(busid: String, operation: String, result: IOReturn)
+    /// What came back at a port after a device went away from it is not that device.
+    case differentDevice(busid: String)
 
     public var description: String {
         switch self {
         case .notFound(let busid):
             return "No USB device \(busid) is attached"
+        case .differentDevice(let busid):
+            return "The device now at \(busid) is not the one that went away from it"
         case .captureNeedsRoot(let busid, let holders):
             return "macOS drivers hold \(busid) (\(holders.joined(separator: ", "))); "
                 + "taking the device from them needs the daemon to run as root"
@@ -99,12 +103,21 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     /// Receives a line for each step of opening the device, for `usbipd probe`.
     private let trace: ((String) -> Void)?
 
+    /// Whether IOUSBHost has said the device was terminated.
+    private let termination: Termination
+
+    /// What the IORegistry said the device was, and its descriptors, when it was opened.
+    /// What comes back at its port after it goes away is compared with these.
+    private(set) var identity: Identity?
+    private(set) var descriptors: Descriptors?
+
     private init(busid: String, device: IOUSBHostDevice, queue: DispatchQueue, captured: Bool,
-                 trace: ((String) -> Void)? = nil) {
+                 termination: Termination, trace: ((String) -> Void)? = nil) {
         self.busid = busid
         self.device = device
         self.queue = queue
         self.captured = captured
+        self.termination = termination
         self.trace = trace
     }
 
@@ -119,8 +132,9 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - trace: receives a line for each step, which `usbipd probe` prints.
+    ///   - releasingMediumLocks: whether to unlock the media of a captured storage device.
     ///   - onTerminated: called when the device goes away, from IOUSBHost's queue.
-    public static func open(busid: String, trace: ((String) -> Void)? = nil,
+    public static func open(busid: String, trace: ((String) -> Void)? = nil, releasingMediumLocks: Bool = true,
                             onTerminated: @escaping @Sendable () -> Void) throws -> IOUSBHostDeviceIO {
         guard let service = findService(busid: busid) else {
             throw USBDeviceOpenError.notFound(busid: busid)
@@ -128,8 +142,10 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         defer { IOObjectRelease(service) }
 
         let queue = DispatchQueue(label: "com.usbipd.mac.device.\(busid)")
+        let termination = Termination()
         let handler: IOUSBHostInterestHandler = { _, messageType, _ in
             if messageType == kIOMessageServiceIsTerminatedValue {
+                termination.record()
                 onTerminated()
             }
         }
@@ -148,10 +164,12 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             plain = nil
         }
         if let plain = plain {
-            let io = IOUSBHostDeviceIO(busid: busid, device: plain, queue: queue, captured: false, trace: trace)
+            let io = IOUSBHostDeviceIO(busid: busid, device: plain, queue: queue, captured: false,
+                                       termination: termination, trace: trace)
             do {
                 try io.openInterfaces(of: service)
                 trace?("Opened without capture")
+                io.recordIdentity(of: service)
                 return io
             } catch HeldInterfaces.held(let numbers) {
                 heldInterfaces = numbers
@@ -187,7 +205,8 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         // The capture terminates the drivers, but the interfaces they were on can stay
         // behind with them. Selecting the configuration again, unmatched, gives fresh
         // interfaces nothing has claimed.
-        let io = IOUSBHostDeviceIO(busid: busid, device: capturedDevice, queue: queue, captured: true, trace: trace)
+        let io = IOUSBHostDeviceIO(busid: busid, device: capturedDevice, queue: queue, captured: true,
+                                   termination: termination, trace: trace)
         do {
             try io.openInterfaces(of: service, reselectingConfiguration: true)
         } catch HeldInterfaces.held(let numbers) {
@@ -196,7 +215,7 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             throw USBDeviceOpenError.interfacesStillHeld(busid: busid, interfaces: numbers,
                                                          holders: stillHeld.isEmpty ? holders : stillHeld)
         }
-        if io.releaseMediumLocks() {
+        if releasingMediumLocks && io.releaseMediumLocks() {
             // The unlock moved the bulk endpoints' data toggles off DATA0, where a client
             // that has just configured the device expects them; its SET_CONFIGURATION is
             // a no-op here, since the configuration is already selected. With a BD-RE
@@ -216,7 +235,90 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             }
         }
         io.logger.info("Captured \(busid) from macOS's drivers (\(holders.joined(separator: ", ")))")
+        io.recordIdentity(of: service)
         return io
+    }
+
+    /// Open the device at `busid` again after it went away from there, if it has come back
+    /// and is the same device. Returns nil while it is not back.
+    ///
+    /// The same device means the same identity in the IORegistry — IDs, release, serial
+    /// number and speed — checked before anything is done to it, and then the same device
+    /// and configuration descriptors. A client keeps using what it was told about the
+    /// device; anything that differs ends its session instead.
+    ///
+    /// The media of its storage interfaces are not unlocked: the device has just reset,
+    /// which unlocked them. Their transports are reset instead. Without that, a BD-RE drive
+    /// took no command block for minutes after coming back, while the client timed out on
+    /// each. Most likely the capture cut off a command macOS's drivers had begun, which
+    /// the drive was still waiting to finish. The reset recovery of the Bulk-Only
+    /// Transport is the remedy for that: with it, the drive took the client's next command
+    /// block at once. It sends a logical unit no command, so the unit attention the
+    /// device's reset left is still the client's.
+    public static func reopen(busid: String, like previous: IOUSBHostDeviceIO, trace: ((String) -> Void)? = nil,
+                              onTerminated: @escaping @Sendable () -> Void) throws -> IOUSBHostDeviceIO? {
+        guard let service = findService(busid: busid) else { return nil }
+        // Until macOS has set the device up, its properties are incomplete and its drivers
+        // are still matching it; a capture now would race them.
+        waitQuiet(service)
+        let identity = Identity(of: service)
+        IOObjectRelease(service)
+        guard let identity = identity else { return nil }
+        guard identity == previous.identity else {
+            throw USBDeviceOpenError.differentDevice(busid: busid)
+        }
+
+        let io: IOUSBHostDeviceIO
+        do {
+            io = try open(busid: busid, trace: trace, releasingMediumLocks: false, onTerminated: onTerminated)
+        } catch USBDeviceOpenError.notFound {
+            // Gone again before it could be opened.
+            return nil
+        }
+        guard io.descriptors == previous.descriptors else {
+            io.close()
+            throw USBDeviceOpenError.differentDevice(busid: busid)
+        }
+        io.resetBulkOnlyTransports()
+        return io
+    }
+
+    /// What the IORegistry says a device is.
+    struct Identity: Equatable {
+        let vendor: UInt32
+        let product: UInt32
+        let release: UInt32?
+        let serialNumber: String?
+        let speed: UInt32?
+
+        /// Nil until the device's IDs are published, which follows the device itself.
+        init?(of service: io_service_t) {
+            guard let vendor = IOUSBHostDeviceIO.uint32Property(service, "idVendor"),
+                  let product = IOUSBHostDeviceIO.uint32Property(service, "idProduct") else { return nil }
+            self.vendor = vendor
+            self.product = product
+            release = IOUSBHostDeviceIO.uint32Property(service, "bcdDevice")
+            serialNumber = IORegistryEntryCreateCFProperty(service, "USB Serial Number" as CFString,
+                                                           kCFAllocatorDefault, 0)?.takeRetainedValue() as? String
+            speed = IOUSBHostDeviceIO.uint32Property(service, "Device Speed")
+        }
+    }
+
+    /// A device's descriptor and its current configuration's, with every interface and
+    /// endpoint descriptor in it.
+    struct Descriptors: Equatable {
+        let device: Data
+        let configuration: Data
+    }
+
+    private func recordIdentity(of service: io_service_t) {
+        identity = Identity(of: service)
+        guard let deviceDescriptor = device.deviceDescriptor else { return }
+        let configuration = device.configurationDescriptor.map {
+            Data(bytes: $0, count: Int(UInt16(littleEndian: $0.pointee.wTotalLength)))
+        }
+        descriptors = Descriptors(device: Data(bytes: deviceDescriptor, count: Int(deviceDescriptor.pointee.bLength)),
+                                  configuration: configuration ?? Data())
     }
 
     private enum HeldInterfaces: Error {
@@ -739,7 +841,7 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         // which is how it is given back.
         device.destroy()
         if captured {
-            logger.info("Gave \(busid) back to macOS")
+            logger.info(termination.happened ? "Let go of \(busid), which had gone away" : "Gave \(busid) back to macOS")
         }
     }
 
@@ -750,35 +852,51 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     /// `BulkOnlyMediumLock`. Called once a captured device's interfaces are open, before
     /// any client has it. Returns whether anything was sent to the device.
     fileprivate func releaseMediumLocks() -> Bool {
-        lock.lock()
-        let storage = interfaces.compactMap { number, interface -> (number: UInt8, inbound: UInt8, outbound: UInt8)? in
-            let descriptor = interface.interfaceDescriptor.pointee
-            guard descriptor.bInterfaceClass == 0x08, descriptor.bInterfaceProtocol == 0x50 else { return nil }
-            let bulk = endpoints.values.filter { $0.interfaceNumber == number && $0.transferType == .bulk }
-            guard let inbound = bulk.first(where: { $0.address & 0x80 != 0 })?.address,
-                  let outbound = bulk.first(where: { $0.address & 0x80 == 0 })?.address else { return nil }
-            return (number: number, inbound: inbound, outbound: outbound)
-        }
-        lock.unlock()
-
-        for interface in storage.sorted(by: { $0.number < $1.number }) {
-            let pipes = CapturedBulkPipes(io: self, interface: interface.number,
-                                          inbound: interface.inbound, outbound: interface.outbound)
-            for lun in 0...maxLUN(of: interface.number) {
+        let storage = bulkOnlyStorage()
+        for pipes in storage {
+            for lun in 0...maxLUN(of: pipes.interface) {
                 let line: String
                 switch BulkOnlyMediumLock.release(lun: lun, over: pipes) {
                 case .released:
-                    line = "Interface \(interface.number), LUN \(lun): medium removal allowed"
+                    line = "Interface \(pipes.interface), LUN \(lun): medium removal allowed"
                 case .refused(let sense):
-                    line = "Interface \(interface.number), LUN \(lun): medium removal not allowed (\(sense))"
+                    line = "Interface \(pipes.interface), LUN \(lun): medium removal not allowed (\(sense))"
                 case .failed(let reason):
-                    line = "Interface \(interface.number), LUN \(lun): allowing medium removal failed (\(reason)); "
+                    line = "Interface \(pipes.interface), LUN \(lun): allowing medium removal failed (\(reason)); "
                         + "the transport was reset"
                 }
                 trace?(line)
             }
         }
         return !storage.isEmpty
+    }
+
+    /// Reset the transport of every bulk-only storage interface: GET MAX LUN, as a host
+    /// starting on the interface sends, then the transport's reset recovery. See `reopen`.
+    fileprivate func resetBulkOnlyTransports() {
+        for pipes in bulkOnlyStorage() {
+            _ = maxLUN(of: pipes.interface)
+            do {
+                try pipes.resetRecovery()
+                trace?("Interface \(pipes.interface): transport reset")
+            } catch {
+                trace?("Interface \(pipes.interface): resetting the transport failed (\(error))")
+            }
+        }
+    }
+
+    /// The bulk pipes of each open bulk-only storage interface, in interface order.
+    private func bulkOnlyStorage() -> [CapturedBulkPipes] {
+        lock.lock()
+        defer { lock.unlock() }
+        return interfaces.compactMap { number, interface -> CapturedBulkPipes? in
+            let descriptor = interface.interfaceDescriptor.pointee
+            guard descriptor.bInterfaceClass == 0x08, descriptor.bInterfaceProtocol == 0x50 else { return nil }
+            let bulk = endpoints.values.filter { $0.interfaceNumber == number && $0.transferType == .bulk }
+            guard let inbound = bulk.first(where: { $0.address & 0x80 != 0 })?.address,
+                  let outbound = bulk.first(where: { $0.address & 0x80 == 0 })?.address else { return nil }
+            return CapturedBulkPipes(io: self, interface: number, inbound: inbound, outbound: outbound)
+        }.sorted { $0.interface < $1.interface }
     }
 
     /// GET MAX LUN: the highest logical unit number of a bulk-only interface. A device
@@ -1053,6 +1171,24 @@ private struct CapturedBulkPipes: BulkOnlyPipes {
         _ = try io.sendControl(reset, data: nil)
         try io.clearHalt(endpoint: inbound)
         try io.clearHalt(endpoint: outbound)
+    }
+}
+
+/// Whether a device has been terminated, set from IOUSBHost's queue.
+private final class Termination: @unchecked Sendable {
+    private let lock = NSLock()
+    private var terminated = false
+
+    func record() {
+        lock.lock()
+        terminated = true
+        lock.unlock()
+    }
+
+    var happened: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminated
     }
 }
 

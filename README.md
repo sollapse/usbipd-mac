@@ -264,14 +264,30 @@ On Windows, an Explorer window open on an optical drive makes Explorer ask the d
 for its features about 34 times a second. Locally that goes unnoticed; over the network
 it took most of the link. Closing the window made reads several times faster.
 
+Give a bus-powered optical drive enough power: its own USB 3 cable, or a powered hub. A
+drive running at USB 2 once dropped off the bus while spinning up a disc (macOS's kernel
+log says "hardware connection lost").
+
+The same BD-RE drive at USB 3 at times dropped off the bus as it went to standby, about
+32 seconds after a fast read, and was back 0.6 seconds later. It did so with macOS alone
+too, which recovers without a word. The daemon holds an attached client's requests while
+its device comes back, for up to 10 seconds, and the client keeps the device if the same
+one comes back at the same port. One that stays away ends the session, as an unplugged
+device does. Windows, caught mid-mount by a drive going away like that, would then not
+start its CD-ROM driver for the drive again (problem code 38) until it restarted;
+restarting Explorer did not clear it.
+
 ### Seeing what a client and a device said
 
 Set `USBIPD_TRACE` in the daemon's environment to log every request, every request the
-daemon carried out itself, every completion with its IOReturn, and every reply. Writing
-the log to a file keeps a terminal's scrollback out of the daemon's way:
+daemon carried out itself, every completion with its IOReturn, and every reply. Requests
+show the first 32 bytes of what they send, so a storage device's commands can be read
+from their command blocks, and replies the first 16 bytes of what comes back. Writing
+the log to a file keeps a terminal's scrollback out of the daemon's way, and appending
+to it keeps what came before a restart:
 
 ```bash
-sudo USBIPD_TRACE=1 usbipd daemon -f > /tmp/usbipd-trace.log 2>&1
+sudo USBIPD_TRACE=1 usbipd daemon -f >> /tmp/usbipd-trace.log 2>&1
 ```
 
 It writes several lines for every transfer, so leave it off when you are not looking.

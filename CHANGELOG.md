@@ -142,8 +142,41 @@ transfer.
 
 Setting `USBIPD_TRACE` in the daemon's environment logs every CMD_SUBMIT and
 CMD_UNLINK, every request carried out on the host, every completion with its IOReturn
-and every reply. An import logs how the device was opened, step by step, as
-`usbipd probe` prints it.
+and every reply. A CMD_SUBMIT carries the first 32 bytes of what goes out, which is a
+whole storage command block, and a RET_SUBMIT the first 16 bytes of what comes back. An
+import logs how the device was opened, step by step, as `usbipd probe` prints it.
+
+### Changed — a device that drops off the bus and comes back keeps its client
+
+A device can drop off the bus and come straight back. The BD-RE drive did so as it went
+to standby after fast reads, 32 seconds after the last one, and was back 0.6 seconds
+later. It did the same with macOS alone, which recovers on its own, so nothing seemed
+amiss. The daemon closed the client's connection when a device went away, as Linux's
+server does, so Windows saw the drive unplugged mid-session.
+
+Now the client's requests are held for up to 10 seconds while the device comes back. If
+the same device comes back at the same port — the same IDs, release, serial number and
+speed, then the same device and configuration descriptors — it is captured again and
+the client keeps it:
+
+- the client's configuration and alternate settings are selected again;
+- what the old device had is answered with EPROTO, a transaction error that clients
+  recover from;
+- what the client sent meanwhile goes to the device, in order.
+
+Its media are not unlocked, since its reset has done that already. The transport of each
+bulk-only storage interface is reset instead. Without that reset, the BD-RE drive took no
+command block for minutes after coming back, while Windows timed out on each. The likely
+cause is that macOS's drivers start on the device as soon as it is back, and the capture
+cut off a command of theirs that the drive was still waiting to finish. The reset
+recovery the Bulk-Only Transport defines is the remedy for that state: with it, the drive
+took Windows' next command block at once when it came back from the next drop, and
+Windows' reads carried on. That reset sends no command to the drive, so the unit
+attention its reset left is still the client's to read. A device that stays away, comes
+back as something else, or has already come back three times in the last minute ends the
+session as before. Each step is logged, starting with a warning when the device goes
+away, since nothing else would say why the client's requests stalled. macOS's kernel log
+has the reason; "hardware connection lost" means it dropped off the bus.
 
 ### Measured — a storage device over a network
 
@@ -154,6 +187,13 @@ and the daemon added nothing measurable. The round trips, at a median of 9 ms ea
 the pace. An Explorer window open on the drive made Explorer ask the drive for its
 features about 34 times a second, which took most of the link: closing the window made
 reads several times faster.
+
+The drive, running at USB 2 on a port that can do USB 3, once dropped off the bus while
+spinning up a disc. macOS logged "hardware connection lost", most likely for lack of
+power. It happened while Windows was mounting the disc. Windows was left with the
+half-mounted volume, with antimalware filter drivers still attached to it, and would
+not start the CD-ROM driver for the drive again (problem code 38). Restarting Explorer
+did not clear it.
 
 ### Known limitations
 

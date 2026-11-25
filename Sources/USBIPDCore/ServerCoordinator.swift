@@ -303,6 +303,22 @@ public class ServerCoordinator: USBIPServer {
         try IOUSBHostDeviceIO.open(busid: busid, trace: trace, onTerminated: onTerminated)
     }
 
+    /// Opens a device again after it went away from an attached client, if it is back at
+    /// its port and is the same device; nil while it is not back. The IOUSBHost device
+    /// layer, unless a test supplies another.
+    public var reopenDeviceIO: (_ busid: String, _ previous: USBDeviceIO, _ trace: @escaping (String) -> Void,
+                                _ onTerminated: @escaping @Sendable () -> Void) throws -> USBDeviceIO? = {
+        busid, previous, trace, onTerminated in
+        guard let previous = previous as? IOUSBHostDeviceIO else {
+            throw USBDeviceOpenError.differentDevice(busid: busid)
+        }
+        return try IOUSBHostDeviceIO.reopen(busid: busid, like: previous, trace: trace, onTerminated: onTerminated)
+    }
+
+    /// How long a device that went away from an attached client has to come back. A drive
+    /// that resets itself is back in under a second, and is captured again in milliseconds.
+    public var deviceComeback = DeviceComeback(window: 10, interval: 0.1)
+
     /// Guards the two tables below.
     private let connectionsLock = NSLock()
 
@@ -453,15 +469,15 @@ public class ServerCoordinator: USBIPServer {
             // What opening the device took is worth having in the log: whether it had to
             // be captured, and what macOS did with its interfaces.
             let log = logger
-            let io = try openDeviceIO(busid, { line in log.info("\(busid): \(line)") }) { [weak state] in
-                // The device went away. Closing the connection tells the client, as
-                // Linux's server does, and the disconnect hands the device back.
-                state?.closeConnection?()
+            let served = ServedDevice()
+            let io = try openDeviceIO(busid, { line in log.info("\(busid): \(line)") }) { [weak self, weak state] in
+                self?.deviceWentAway(busid, served: served, state: state)
             }
             let attachment = USBIPAttachment(busid: busid, io: io, maxTransferSize: Int(config.maxUSBBufferSize)) {
                 [weak state] data in
                 state?.send?(data)
             }
+            served.set(attachment: attachment, io: io)
             logger.info("Serving \(busid) to a client", context: ["busid": busid])
             return attachment
         } catch {
@@ -469,6 +485,83 @@ public class ServerCoordinator: USBIPServer {
             attachedBusids.remove(busid)
             connectionsLock.unlock()
             throw error
+        }
+    }
+
+    /// An attached device went away. The client's requests are held while it comes back,
+    /// and if it does, the client keeps it. Otherwise closing the connection tells the
+    /// client, as Linux's server does, and the disconnect lets go of the device.
+    ///
+    /// Each step is said in the log, since nothing else in it would say why the client
+    /// lost the device or why its requests stalled. macOS's kernel log has the reason the
+    /// device went, such as "hardware connection lost" for one that dropped off the bus.
+    private func deviceWentAway(_ busid: String, served: ServedDevice, state: USBIPConnectionState?) {
+        let log = logger
+        guard let state = state, let current = served.current, state.attachment === current.attachment else {
+            log.warning("\(busid) went away while a client was attaching it; closing that client's connection")
+            state?.closeConnection?()
+            return
+        }
+        // Gone again after being opened again, before its client had it: the wait that
+        // opened it sees to that once it has handed it over.
+        guard served.beginWaiting() else { return }
+        guard served.mayComeBack() else {
+            _ = served.endWaiting()
+            log.warning("\(busid) went away again, too soon after coming back; closing that client's connection")
+            state.closeConnection?()
+            return
+        }
+
+        let attachment = current.attachment
+        let previous = current.io
+        attachment.deviceWentAway()
+        let comeback = deviceComeback
+        log.warning("\(busid) went away while a client had it attached; holding that client's requests "
+                    + "for up to \(Int(comeback.window)) s while it comes back")
+
+        let started = Date()
+        let reopen = reopenDeviceIO
+        let trace: (String) -> Void = { line in log.info("\(busid): \(line)") }
+        let onTerminated: @Sendable () -> Void = { [weak self, weak state] in
+            self?.deviceWentAway(busid, served: served, state: state)
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak state] in
+            let outcome = comeback.wait(
+                reopen: { try reopen(busid, previous, trace, onTerminated) },
+                stillWanted: { state?.attachment === attachment })
+
+            switch outcome {
+            case .back(let io):
+                do {
+                    try attachment.resume(with: io)
+                    served.set(attachment: attachment, io: io)
+                    log.info("\(busid) came back after \(String(format: "%.1f", Date().timeIntervalSince(started))) s; "
+                             + "its client keeps it")
+                    if served.endWaiting() {
+                        self?.deviceWentAway(busid, served: served, state: state)
+                    }
+                    return
+                } catch AttachmentError.ended {
+                    io.close()
+                } catch {
+                    io.close()
+                    log.warning("\(busid) came back, but its client's settings could not be selected again "
+                                + "(\(error)); closing that client's connection")
+                    state?.closeConnection?()
+                }
+            case .refused(let error):
+                log.warning("\(busid) came back, but could not be taken again (\(error)); "
+                            + "closing that client's connection")
+                state?.closeConnection?()
+            case .timedOut:
+                log.warning("\(busid) did not come back within \(Int(comeback.window)) s; "
+                            + "closing that client's connection")
+                state?.closeConnection?()
+            case .abandoned:
+                // The client went meanwhile, and its disconnect let go of everything.
+                break
+            }
+            _ = served.endWaiting()
         }
     }
 
@@ -776,3 +869,60 @@ public class ServerCoordinator: USBIPServer {
     }
 }
 
+/// The attachment serving an imported device and the device it has, for the handler of
+/// that device going away, which runs on IOUSBHost's queue. Both are held weakly: the
+/// connection holds the attachment and the attachment its device, and a device that went
+/// away holds this through its handler.
+private final class ServedDevice: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var attachment: USBIPAttachment?
+    private weak var io: USBDeviceIO?
+    private var comebacks = ComebackBudget(limit: 3, period: 60)
+    private var waiting = false
+    private var wentAwayWhileWaiting = false
+
+    func set(attachment: USBIPAttachment, io: USBDeviceIO) {
+        lock.lock()
+        self.attachment = attachment
+        self.io = io
+        lock.unlock()
+    }
+
+    /// Both, once the attachment exists and while it does.
+    var current: (attachment: USBIPAttachment, io: USBDeviceIO)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let attachment = attachment, let io = io else { return nil }
+        return (attachment, io)
+    }
+
+    /// Whether the device may come back once more.
+    func mayComeBack() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return comebacks.allows()
+    }
+
+    /// Start waiting for the device to come back. With a wait already on, the device it
+    /// opened has gone away before its client had it: that is noted for the wait, and
+    /// this returns false.
+    func beginWaiting() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if waiting {
+            wentAwayWhileWaiting = true
+            return false
+        }
+        waiting = true
+        wentAwayWhileWaiting = false
+        return true
+    }
+
+    /// End the wait. Returns whether the device it opened went away meanwhile.
+    func endWaiting() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        waiting = false
+        return wentAwayWhileWaiting
+    }
+}

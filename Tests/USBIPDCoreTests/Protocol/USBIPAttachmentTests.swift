@@ -71,7 +71,11 @@ private final class RecordingDeviceIO: USBDeviceIO, @unchecked Sendable {
     func abortControl() { lock.lock(); controlAborts += 1; lock.unlock() }
     func abort(endpoint: UInt8) { lock.lock(); aborted.append(endpoint); lock.unlock() }
     func clearHalt(endpoint: UInt8) throws { lock.lock(); clearedHalts.append(endpoint); lock.unlock() }
-    func setConfiguration(_ value: UInt8) throws { lock.lock(); configurations.append(value); lock.unlock() }
+    var configurationResult: IOReturn = kIOReturnSuccess
+    func setConfiguration(_ value: UInt8) throws {
+        lock.lock(); configurations.append(value); lock.unlock()
+        if configurationResult != kIOReturnSuccess { throw USBDeviceIOError(configurationResult, "configuration") }
+    }
     func setAlternateSetting(interface: UInt8, alternate: UInt8) throws {
         lock.lock(); alternateSettings.append([interface, alternate]); lock.unlock()
     }
@@ -496,6 +500,200 @@ final class USBIPAttachmentTests: XCTestCase {
         XCTAssertEqual(made.count, 5)
         XCTAssertEqual(Set(device.recycled), Set(made))
         XCTAssertEqual(device.recycled.count, made.count, "no buffer recycled twice")
+    }
+
+    // MARK: - A device that goes away and comes back
+
+    private func wentAway() {
+        attachment.deviceWentAway()
+        attachment.waitUntilProcessed()
+    }
+
+    /// The device that came back, with the same endpoints.
+    private func deviceBack() -> RecordingDeviceIO {
+        let back = RecordingDeviceIO()
+        back.endpoints = device.endpoints
+        return back
+    }
+
+    /// Nothing more can be done with a device that went away, so it is let go of at once:
+    /// what it had completes as it is aborted.
+    func testADeviceThatWentAwayIsLetGoOf() {
+        wentAway()
+        XCTAssertTrue(device.closed)
+    }
+
+    /// What the client sends meanwhile waits, and goes to the device that came back.
+    func testRequestsSentWhileTheDeviceIsAwayGoToTheDeviceThatCameBack() throws {
+        wentAway()
+        submit(1, ep: 2, direction: 0, length: 31, payload: Data(repeating: 0x55, count: 31))
+        submit(2, ep: 1, direction: 1, length: 13)
+        XCTAssertTrue(device.pending.isEmpty)
+        XCTAssertTrue(replies.all.isEmpty)
+
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertEqual(back.pending.map(\.endpoint), [0x02, 0x81])
+        back.pending[0].complete!(kIOReturnSuccess, 31)
+        back.pending[1].complete!(kIOReturnSuccess, 13)
+        attachment.waitUntilProcessed()
+        XCTAssertEqual(replies.submits.map(\.seqnum), [1, 2])
+        XCTAssertEqual(replies.submits.map(\.status), [0, 0])
+    }
+
+    /// What the device had is answered once it is back, as a transaction error, and not
+    /// before: what a client does to recover needs a device to do it with.
+    func testRequestsTheDeviceHadAreAnsweredWithEPROTOOnceItIsBack() throws {
+        submit(1, ep: 1, direction: 1, length: 13)
+        wentAway()
+        complete(0, USBIOReturn.aborted, 0)
+        XCTAssertTrue(replies.all.isEmpty)
+
+        try attachment.resume(with: deviceBack())
+        XCTAssertEqual(replies.submits.map(\.seqnum), [1])
+        XCTAssertEqual(replies.submits.map(\.status), [-71])
+    }
+
+    /// Even one that completed after the device went: its buffer was mapped for that
+    /// device, and is not read.
+    func testACompletionAfterTheDeviceWentIsAnsweredAsLost() throws {
+        submit(1, ep: 1, direction: 1, length: 13)
+        wentAway()
+        fill(device.pending[0].data, [0x55, 0x53, 0x42, 0x53])
+        complete(0, kIOReturnSuccess, 13)
+        XCTAssertTrue(replies.all.isEmpty)
+
+        try attachment.resume(with: deviceBack())
+        XCTAssertEqual(replies.submits.map(\.status), [-71])
+        XCTAssertNil(replies.submits[0].transferBuffer)
+    }
+
+    /// A request the device never completed is answered the same way, and a completion
+    /// that turns up afterwards is ignored. Its buffer is not handed to the new device.
+    func testALateCompletionFromTheDeviceThatWentIsIgnored() throws {
+        submit(1, ep: 1, direction: 1, length: 13)
+        wentAway()
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertEqual(replies.submits.map(\.status), [-71])
+
+        complete(0, USBIOReturn.aborted, 0)
+        XCTAssertEqual(replies.submits.count, 1)
+        XCTAssertTrue(back.recycled.isEmpty)
+        XCTAssertTrue(device.recycled.isEmpty)
+    }
+
+    /// With the device away there is nothing to abort: withdrawals are answered at once,
+    /// and what they withdrew is not answered again.
+    func testUnlinksWhileTheDeviceIsAwayAreAnsweredAtOnce() throws {
+        submit(1, ep: 1, direction: 1, length: 13)
+        wentAway()
+        submit(2, ep: 1, direction: 1, length: 13)
+        unlink(3, target: 1)
+        unlink(4, target: 2)
+        unlink(5, target: 99)
+        XCTAssertEqual(replies.unlinks.map(\.seqnum), [3, 4, 5])
+        XCTAssertEqual(replies.unlinks.map(\.status), [-104, -104, 0])
+
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertTrue(back.pending.isEmpty)
+        XCTAssertTrue(replies.submits.isEmpty)
+    }
+
+    /// A request withdrawn before the device went is answered by its RET_UNLINK alone.
+    func testARequestWithdrawnBeforeTheDeviceWentGetsOnlyItsUnlinkReply() throws {
+        submit(1, ep: 1, direction: 1, length: 13)
+        unlink(2, target: 1)
+        wentAway()
+        complete(0, USBIOReturn.aborted, 0)
+        XCTAssertEqual(replies.sequence, ["unlink 2"])
+
+        try attachment.resume(with: deviceBack())
+        XCTAssertEqual(replies.sequence, ["unlink 2"])
+    }
+
+    /// A request caught up in an abort when the device went goes with it.
+    func testARequestCaughtInAnAbortWhenTheDeviceWentIsAnsweredOnceItIsBack() throws {
+        submit(1, ep: 1, direction: 1, length: 512)
+        submit(2, ep: 1, direction: 1, length: 512)
+        unlink(3, target: 1)
+        complete(1, USBIOReturn.aborted, 0)
+        wentAway()
+        complete(0, USBIOReturn.aborted, 0)
+        XCTAssertEqual(replies.sequence, ["unlink 3"])
+
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertTrue(back.pending.isEmpty)
+        XCTAssertEqual(replies.sequence, ["unlink 3", "submit 2"])
+        XCTAssertEqual(replies.submits.map(\.status), [-71])
+    }
+
+    /// The client's configuration and alternate settings are selected on the device that
+    /// came back, which comes back in its first configuration.
+    func testTheClientsSettingsAreSelectedAgain() throws {
+        submit(1, ep: 0, direction: 0, length: 0, setup: [0x00, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00])
+        submit(2, ep: 0, direction: 0, length: 0, setup: [0x01, 0x0B, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00])
+        wentAway()
+
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertEqual(back.configurations, [2])
+        XCTAssertEqual(back.alternateSettings, [[1, 1]])
+    }
+
+    /// A configuration already in effect is not selected again.
+    func testTheConfigurationInEffectIsLeftAlone() throws {
+        submit(1, ep: 0, direction: 0, length: 0, setup: [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+        wentAway()
+
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        XCTAssertTrue(back.configurations.isEmpty)
+        XCTAssertTrue(back.alternateSettings.isEmpty)
+    }
+
+    /// A device that will not take the client's settings cannot carry on its session.
+    func testSettingsTheDeviceWillNotTakeEndTheSession() {
+        submit(1, ep: 0, direction: 0, length: 0, setup: [0x00, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00])
+        wentAway()
+
+        let back = deviceBack()
+        back.configurationResult = USBIOReturn.exclusiveAccess
+        XCTAssertThrowsError(try attachment.resume(with: back))
+    }
+
+    /// A session that ended while its device was away does not take the device back.
+    func testAnEndedSessionTakesNoDevice() {
+        wentAway()
+        submit(1, ep: 1, direction: 1, length: 13)
+        attachment.close()
+
+        let back = deviceBack()
+        XCTAssertThrowsError(try attachment.resume(with: back)) { error in
+            XCTAssertEqual(error as? AttachmentError, .ended("1-1"))
+        }
+        XCTAssertTrue(back.pending.isEmpty)
+        XCTAssertTrue(replies.all.isEmpty)
+    }
+
+    /// The device can go away again after coming back.
+    func testADeviceCanGoAwayAgain() throws {
+        wentAway()
+        let back = deviceBack()
+        try attachment.resume(with: back)
+        submit(1, ep: 1, direction: 1, length: 13)
+        XCTAssertEqual(back.pending.count, 1)
+
+        attachment.deviceWentAway()
+        attachment.waitUntilProcessed()
+        XCTAssertTrue(back.closed)
+        back.pending[0].complete!(USBIOReturn.aborted, 0)
+        attachment.waitUntilProcessed()
+
+        try attachment.resume(with: deviceBack())
+        XCTAssertEqual(replies.submits.map(\.status), [-71])
     }
 
     // MARK: - Lifetime

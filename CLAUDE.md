@@ -138,13 +138,25 @@ names: a driver being attached settles nothing, and the chip alone does not tell
 hands the connection to a `USBIPAttachment`, which queues every URB with IOUSBHost as
 it arrives and replies from the completion; nothing blocks, and each endpoint keeps
 its order. It carries out SET_CONFIGURATION (through the host, unmatched by macOS's
-drivers), SET_INTERFACE (replacing the interface's pipes), CLEAR_FEATURE(ENDPOINT_HALT)
-(device side by request, host side by `clearStall`) and answers SET_ADDRESS and port
-resets itself. Isochronous transfers are IOUSBHost transaction lists, one per USB/IP
-packet (macOS 12+). The TCP stream is framed by `USBIPStreamFramer`; before that, each
-read was taken as exactly one message. The older `USBRequestHandler` /
-`USBSubmitProcessor` / `IOKitUSBInterface` pipeline is now reached only by unit tests
-that build a `RequestProcessor` without an attachment opener.
+drivers), SET_INTERFACE (replacing the interface's pipes),
+CLEAR_FEATURE(ENDPOINT_HALT) (device side by request, host side by `clearStall`) and
+answers SET_ADDRESS and hub port resets itself. Linux's server resets the device for a
+port reset; here a reset would end the capture and hand the device back to macOS. A
+device that goes away while attached is waited for (`DeviceComeback`, 10 s): the
+attachment holds the client's requests, and if the same device comes back at its port
+(`IOUSBHostDeviceIO.reopen` compares the registry identity, then the descriptors) it
+is captured again without the medium unlock but with a Bulk-Only reset recovery of
+each storage interface. Without it the BD-RE drive took no command block for minutes,
+most likely because the capture cut off a command macOS's drivers had begun; with the
+reset it took the client's next command block at once after a comeback. Then the
+client's settings are selected again, what went with the old device is answered
+EPROTO, and the held requests go to the new one. The BD-RE drive at times dropped off
+the bus at its 32-second standby after fast reads, under macOS alone too, and was back
+in 0.6 s. Isochronous transfers are IOUSBHost transaction lists, one per USB/IP packet
+(macOS 12+). The TCP stream is framed by `USBIPStreamFramer`; before that, each read
+was taken as exactly one message. The older `USBRequestHandler` / `USBSubmitProcessor`
+/ `IOKitUSBInterface` pipeline is now reached only by unit tests that build a
+`RequestProcessor` without an attachment opener.
 
 **Validated on hardware for bulk and control transfers only.** The BD-RE drive went
 through all of the above that bulk-only storage uses: capture, control and bulk

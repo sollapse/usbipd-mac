@@ -9,11 +9,15 @@ import Common
 public enum AttachmentError: Error, CustomStringConvertible, LocalizedError, Equatable {
     /// Another client has the device. A second capture would take it from that client.
     case alreadyAttached(String)
+    /// The session ended while its device was away.
+    case ended(String)
 
     public var description: String {
         switch self {
         case .alreadyAttached(let busid):
             return "\(busid) is already attached by another client"
+        case .ended(let busid):
+            return "The session serving \(busid) has ended"
         }
     }
 
@@ -47,8 +51,16 @@ public enum URBTransferFlags {
 /// - CLEAR_FEATURE(ENDPOINT_HALT) clears the halt on the device and on the host. A raw
 ///   request would clear only the device's side and leave the host's endpoint halted,
 ///   failing every later transfer.
-/// - SET_ADDRESS and a hub port reset are answered without action, as Linux's server
-///   does: the client's view of addresses and ports is its own.
+/// - SET_ADDRESS is answered without action: the device has its address, and the
+///   client's view of addresses is its own.
+/// - A hub port reset is answered without action too. Linux's server resets the device
+///   for it; here a reset would end the capture and hand the device back to macOS.
+///
+/// A device can go away and come straight back, as a drive that resets itself does (see
+/// `DeviceComeback`). From `deviceWentAway()` to `resume(with:)`, what the client sends is
+/// held, and what the device had is answered once it is back, with EPROTO: a transaction
+/// error, which a client recovers from with the device it then has. The client's
+/// configuration and alternate settings are selected again first.
 ///
 /// A withdrawn request (CMD_UNLINK) is aborted at the device and answered by RET_UNLINK
 /// alone once it has completed, as Linux's server does. IOUSBHost can only abort a whole
@@ -65,7 +77,6 @@ public enum URBTransferFlags {
 public final class USBIPAttachment: @unchecked Sendable {
     public let busid: String
 
-    private let io: USBDeviceIO
     private let maxTransferSize: Int
     private let send: @Sendable (Data) -> Void
     private let queue: DispatchQueue
@@ -73,10 +84,19 @@ public final class USBIPAttachment: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.usbipd.mac", category: "attachment")
 
     // Confined to `queue`.
+    /// The device, replaced when it comes back after going away.
+    private var io: USBDeviceIO
     private var inFlight: [UInt32: InFlightURB] = [:]
     private var draining: [UInt8: Set<UInt32>] = [:]
     private var isClosed = false
     private var lastGeneration: UInt64 = 0
+    /// From the device going away until it is back or the session ends.
+    private var deviceAway = false
+    /// CMD_SUBMITs that arrived while the device was away, in order.
+    private var heldWhileAway: [(seqnum: UInt32, message: Data)] = []
+    /// What the client selected, to be selected again on a device that comes back.
+    private var clientConfiguration: UInt8?
+    private var clientAlternates: [UInt8: UInt8] = [:]
 
     private enum Stage {
         /// Queued with the device.
@@ -86,6 +106,8 @@ public final class USBIPAttachment: @unchecked Sendable {
         case awaitingResubmit
         /// Arrived while its endpoint was draining; queued when it has.
         case held
+        /// Went with a device that went away; answered when it is back.
+        case lost
     }
 
     private struct InFlightURB {
@@ -130,7 +152,7 @@ public final class USBIPAttachment: @unchecked Sendable {
     /// Stop serving: abort what is in flight and give the device back to macOS. Returns
     /// once the device has been given back.
     public func close() {
-        let work = {
+        onQueue {
             guard !self.isClosed else { return }
             self.isClosed = true
             // The device first: its aborts complete what is in flight before the
@@ -138,12 +160,68 @@ public final class USBIPAttachment: @unchecked Sendable {
             self.io.close()
             self.inFlight.removeAll()
             self.draining.removeAll()
+            self.heldWhileAway.removeAll()
         }
+    }
+
+    /// The device went away. Let go of it, and hold what the client sends until
+    /// `resume(with:)` brings it back or the session ends.
+    public func deviceWentAway() {
+        queue.async {
+            guard !self.isClosed, !self.deviceAway else { return }
+            self.deviceAway = true
+            self.trace("the device went away; holding what the client sends until it is back")
+            // What it had completes as it is aborted, and is set aside as lost. Their
+            // buffers are not read again: they were mapped for this device.
+            self.io.close()
+        }
+    }
+
+    /// The device is back, opened as `newIO`. Select the client's configuration and
+    /// alternate settings on it again, answer what went with the old device, and queue
+    /// what the client sent meanwhile, in order.
+    ///
+    /// Throws if the session ended meanwhile, or the client's settings cannot be selected
+    /// again. The caller then ends the session, and closes `newIO`, which closing twice
+    /// does no harm.
+    public func resume(with newIO: USBDeviceIO) throws {
+        try onQueue {
+            guard !self.isClosed else { throw AttachmentError.ended(self.busid) }
+            self.io = newIO
+            if let value = self.clientConfiguration, value != newIO.currentConfiguration {
+                try newIO.setConfiguration(value)
+            }
+            for (number, alternate) in self.clientAlternates.sorted(by: { $0.key < $1.key }) where alternate != 0 {
+                try newIO.setAlternateSetting(interface: number, alternate: alternate)
+            }
+
+            for seqnum in self.inFlight.keys.sorted() {
+                guard let entry = self.inFlight[seqnum] else { continue }
+                if let unlinkSeqnum = entry.withdrawnBy {
+                    self.sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid,
+                                         status: -LinuxErrno.econnreset)
+                } else {
+                    self.trace("seq \(seqnum) went with the device")
+                    self.reply(to: entry.request, status: -LinuxErrno.eproto)
+                }
+            }
+            self.inFlight.removeAll()
+            self.draining.removeAll()
+            self.deviceAway = false
+
+            let held = self.heldWhileAway
+            self.heldWhileAway.removeAll()
+            self.trace("the device is back, with \(held.count) held \(held.count == 1 ? "request" : "requests") to queue")
+            held.forEach { self.process($0.message) }
+        }
+    }
+
+    /// Run on the queue, from it or from elsewhere.
+    private func onQueue<T>(_ work: () throws -> T) rethrows -> T {
         if DispatchQueue.getSpecific(key: queueKey) == true {
-            work()
-        } else {
-            queue.sync(execute: work)
+            return try work()
         }
+        return try queue.sync(execute: work)
     }
 
     /// Wait until every message and completion handed over so far has been processed.
@@ -166,12 +244,34 @@ public final class USBIPAttachment: @unchecked Sendable {
         }
 
         switch header.command {
+        case .submit where deviceAway:
+            trace("CMD_SUBMIT seq \(header.seqnum) held until the device is back")
+            heldWhileAway.append((seqnum: header.seqnum, message: message))
         case .submit:
             submit(message, header: header)
+        case .unlink where deviceAway:
+            unlinkWhileAway(message)
         case .unlink:
             unlink(message)
         case .retSubmit, .retUnlink:
             logger.warning("Ignoring a reply sent by the client")
+        }
+    }
+
+    /// With the device away there is nothing to abort, so a withdrawal is answered at once.
+    private func unlinkWhileAway(_ message: Data) {
+        guard let request = try? USBIPUnlinkRequest.decode(from: message) else { return }
+        trace("CMD_UNLINK seq \(request.seqnum) for seq \(request.unlinkSeqnum), with the device away")
+
+        if let index = heldWhileAway.firstIndex(where: { $0.seqnum == request.unlinkSeqnum }) {
+            heldWhileAway.remove(at: index)
+            sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: -LinuxErrno.econnreset)
+        } else if let entry = inFlight[request.unlinkSeqnum], entry.withdrawnBy == nil {
+            // It went with the device, or will once its abort completes.
+            inFlight[request.unlinkSeqnum] = nil
+            sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: -LinuxErrno.econnreset)
+        } else {
+            sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: 0)
         }
     }
 
@@ -269,13 +369,22 @@ public final class USBIPAttachment: @unchecked Sendable {
         case (0x00, 0x09):
             // SET_CONFIGURATION
             let value = UInt8(truncatingIfNeeded: setup.wValue)
-            return status { try io.setConfiguration(value) }
+            let result = status { try io.setConfiguration(value) }
+            if result == 0 {
+                clientConfiguration = value
+                clientAlternates = [:]
+            }
+            return result
 
         case (0x01, 0x0B):
             // SET_INTERFACE
             let interface = UInt8(truncatingIfNeeded: setup.wIndex)
             let alternate = UInt8(truncatingIfNeeded: setup.wValue)
-            return status { try io.setAlternateSetting(interface: interface, alternate: alternate) }
+            let result = status { try io.setAlternateSetting(interface: interface, alternate: alternate) }
+            if result == 0 {
+                clientAlternates[interface] = alternate
+            }
+            return result
 
         case (0x02, 0x01) where setup.wValue == 0 && setup.wIndex & 0x0F != 0:
             // CLEAR_FEATURE(ENDPOINT_HALT). The device's side with the request itself,
@@ -322,6 +431,13 @@ public final class USBIPAttachment: @unchecked Sendable {
     /// arrival, so a request queued again after an abort starts from its original data.
     private func start(_ seqnum: UInt32) {
         guard var entry = inFlight[seqnum] else { return }
+        if deviceAway {
+            // Due again after an abort, with the device gone: it is answered with the rest
+            // of what went with it.
+            entry.stage = .lost
+            inFlight[seqnum] = entry
+            return
+        }
         let request = entry.request
         lastGeneration += 1
         entry.generation = lastGeneration
@@ -481,7 +597,7 @@ public final class USBIPAttachment: @unchecked Sendable {
         }
 
         switch entry.stage {
-        case .held, .awaitingResubmit:
+        case .held, .awaitingResubmit, .lost:
             // Not with the device: nothing to abort.
             inFlight[request.unlinkSeqnum] = nil
             sendUnlinkReply(seqnum: request.seqnum, devid: request.devid, status: -LinuxErrno.econnreset)
@@ -552,6 +668,10 @@ public final class USBIPAttachment: @unchecked Sendable {
         // already set aside to be queued again, belongs to nothing current.
         guard !isClosed, var entry = inFlight[seqnum], entry.generation == generation,
               entry.stage == .queued else { return }
+        if deviceAway {
+            setAsideWithDevice(seqnum, entry)
+            return
+        }
 
         // An OUT with a zero-length packet completes twice. A data part that succeeds
         // waits for the packet; one that fails is answered at once, since the packet
@@ -590,6 +710,20 @@ public final class USBIPAttachment: @unchecked Sendable {
         finishDraining(entry.endpoint)
     }
 
+    /// A request that completed after its device went away and was let go of. Its buffers
+    /// may no longer be readable, so it is answered once the device is back, as lost; a
+    /// withdrawn one is answered now.
+    private func setAsideWithDevice(_ seqnum: UInt32, _ entry: InFlightURB) {
+        var entry = entry
+        if let unlinkSeqnum = entry.withdrawnBy {
+            inFlight[seqnum] = nil
+            sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
+        } else {
+            entry.stage = .lost
+            inFlight[seqnum] = entry
+        }
+    }
+
     /// Give a finished attempt's buffers back for other transfers. Only once IOKit has
     /// completed the request and the reply has been built from them.
     private func recycleBuffers(of entry: inout InFlightURB) {
@@ -607,6 +741,10 @@ public final class USBIPAttachment: @unchecked Sendable {
                                       completed: [USBIsochronousTransaction]) {
         guard !isClosed, var entry = inFlight[seqnum], entry.generation == generation,
               entry.stage == .queued else { return }
+        if deviceAway {
+            setAsideWithDevice(seqnum, entry)
+            return
+        }
         let wasDraining = leaveDrain(seqnum, endpoint: entry.endpoint)
         inFlight[seqnum] = nil
 
