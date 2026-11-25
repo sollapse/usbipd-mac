@@ -44,14 +44,20 @@ public enum USBDeviceOpenError: Error, CustomStringConvertible, LocalizedError, 
                 + "`usbipd kext \(busid)` writes a codeless kext that keeps its driver off "
                 + "this device"
         case .storageNeedsFullDiskAccess(let busid, let interface, let launchedFrom):
-            let app = launchedFrom.first { $0.hasSuffix(".app") }
-            let grantee = app.map { "\($0), which this usbipd was started from" }
-                ?? "the usbipd binary itself, since no app started it"
-            return "macOS let go of \(busid), but opening its storage interface \(interface) "
+            let refusal = "macOS let go of \(busid), but opening its storage interface \(interface) "
                 + "needs Full Disk Access, and this process does not have it (started from: "
-                + "\(launchedFrom.joined(separator: " < "))). Grant it to \(grantee), in "
-                + "System Settings > Privacy & Security > Full Disk Access, restart that app, "
-                + "and try again"
+                + "\(launchedFrom.joined(separator: " < ")))."
+            if let app = launchedFrom.first(where: { $0.hasSuffix(".app") }) {
+                return refusal + " Grant it to \(app), which this usbipd was started from, in "
+                    + "System Settings > Privacy & Security > Full Disk Access, restart that app, "
+                    + "and try again"
+            }
+            // Over SSH there is no app in the chain, and the check refused a daemon there
+            // although the session itself could read files Full Disk Access protects.
+            return refusal + " It was not started from an app. Start the daemon from a terminal "
+                + "app that has Full Disk Access; one started over SSH is refused. A daemon "
+                + "started at boot would need the grant on the usbipd binary itself, which has "
+                + "not been tested"
         case .openFailed(let busid, let operation, let result):
             return "\(operation) failed for \(busid): \(USBIOReturn.describe(result))"
         }
@@ -87,6 +93,7 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     private var alternates: [UInt8: UInt8] = [:]
     private var pipes: [UInt8: IOUSBHostPipe] = [:]
     private var endpoints: [UInt8: USBEndpointInfo] = [:]
+    private var bufferPool: [Int: [NSMutableData]] = [:]
     private var isClosed = false
 
     /// Receives a line for each step of opening the device, for `usbipd probe`.
@@ -446,13 +453,42 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
     }
 
     public func makeBuffer(length: Int) -> NSMutableData {
+        guard length > 0 else { return NSMutableData() }
+
+        // A storage client asks for the same few sizes over and over (a 31-byte command,
+        // a 64 KiB read, a 13-byte status), and making one costs a call into the kernel
+        // and a mapping. Buffers come back through recycle and are handed out again.
+        lock.lock()
+        if var free = bufferPool[length], let buffer = free.popLast() {
+            bufferPool[length] = free
+            lock.unlock()
+            return buffer
+        }
+        lock.unlock()
+
         // Memory IOUSBHost maps for the controller saves a copy on every transfer. It
         // cannot be resized, which is fine for a buffer made to the request's size.
-        if length > 0, let data = try? device.ioData(withCapacity: length) {
+        if let data = try? device.ioData(withCapacity: length) {
             return data
         }
         return NSMutableData(length: length) ?? NSMutableData()
     }
+
+    public func recycle(_ buffer: NSMutableData) {
+        let length = buffer.length
+        guard length > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        var free = bufferPool[length] ?? []
+        if free.count < Self.buffersKeptPerSize {
+            free.append(buffer)
+            bufferPool[length] = free
+        }
+    }
+
+    /// Enough for a stream with several transfers of one size in flight.
+    private static let buffersKeptPerSize = 16
 
     public func enqueueControl(_ setup: USBSetupPacket, data: NSMutableData?,
                                completion: @escaping @Sendable (IOReturn, Int) -> Void) throws {
@@ -625,7 +661,12 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         do {
             try interface.selectAlternateSetting(Int(alternate))
         } catch {
-            throw USBDeviceIOError(ioReturn(from: error), "Selecting alternate setting \(alternate) of interface \(number)")
+            let result = ioReturn(from: error)
+            // The setting already in effect: nothing changed, and nothing to rebuild.
+            if result == USBIOReturn.hostRedundant {
+                return
+            }
+            throw USBDeviceIOError(result, "Selecting alternate setting \(alternate) of interface \(number)")
         }
 
         // Selecting a setting closes the interface's pipes, so the old ones are gone
@@ -652,6 +693,8 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         pipes = [:]
         endpoints = [:]
         interfaces = [:]
+        // Pooled buffers are mapped through the device's connection; let them go first.
+        bufferPool = [:]
         lock.unlock()
 
         openPipes.forEach { try? $0.__abort(with: .synchronous) }

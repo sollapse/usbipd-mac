@@ -310,9 +310,11 @@ public class BindCommand: Command {
                         - Eject its volumes before attaching. Taking it would cut them off
                           unflushed, so the daemon refuses while one is mounted.
                         - macOS opens a storage interface only to a process with Full Disk
-                          Access. Grant it in System Settings > Privacy & Security > Full Disk
-                          Access, to the terminal app the daemon runs from, or to the usbipd
-                          binary when it runs at boot.
+                          Access, and goes by the app the daemon was started from. Grant it in
+                          System Settings > Privacy & Security > Full Disk Access to the
+                          terminal app you start the daemon from. A daemon started over SSH
+                          is refused. Started at boot, as brew services does, the daemon
+                          would need the grant itself, which has not been tested.
                         `sudo usbipd probe \(busidText)` checks both without a client.
                         """)
                 }

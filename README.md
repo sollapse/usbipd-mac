@@ -24,17 +24,23 @@
 >
 > **Mass storage needs Full Disk Access.** Capturing a storage device terminates its
 > driver; the daemon then selects the configuration again so the interface comes back
-> unclaimed, and macOS lets only a process with Full Disk Access open it. Grant it in
-> System Settings > Privacy & Security > Full Disk Access — to the terminal app the
-> daemon runs from, or to the `usbipd` binary when it runs at boot. Measured on macOS
-> 27.0.1 with a USB BD-RE drive. A device whose volumes are mounted is refused rather
-> than captured, since capturing it would cut them off unflushed: eject them first. If
-> some macOS release keeps a storage interface anyway, `usbipd kext <busid>` writes a
-> codeless kext that keeps the driver off that device model; loading it needs System
-> Integrity Protection off, and the command prints the steps.
+> unclaimed, and macOS lets only a process with Full Disk Access open it. macOS goes by
+> the app the daemon was started from: grant it, in System Settings > Privacy &
+> Security > Full Disk Access, to the terminal app you start the daemon from, and start
+> it there. A daemon started over SSH is refused, even when the SSH session can read
+> protected files. A daemon started at boot (`brew services`) would need the grant on
+> the `usbipd` binary itself, which has not been tested. Measured on macOS 27.0.1 with a
+> USB BD-RE drive, served to Windows 11 through usbip-win2. A device whose volumes are
+> mounted is refused rather than captured, since capturing it would cut them off
+> unflushed: eject them first. If some macOS release keeps a storage interface anyway,
+> `usbipd kext <busid>` writes a codeless kext that keeps the driver off that device
+> model; loading it needs System Integrity Protection off, and the command prints the
+> steps.
 >
-> The capture path, isochronous transfers and the kext are new and have not yet been
-> validated against hardware. Seizing the interface (`USBInterfaceOpenSeize`) was
+> The capture path has been validated against hardware with that drive: capture, bulk
+> and control transfers, stalls and their clearing, and handing the device back.
+> Isochronous and interrupt transfers, capturing HID, audio, camera and CDC-ACM devices,
+> and the kext have not been yet. Seizing the interface (`USBInterfaceOpenSeize`) was
 > measured and does not release a driver, and neither unmounting nor ejecting releases
 > it; capture is a different operation. Note this is also *not* the App Sandbox entitlement
 > `com.apple.security.device.usb`, which is freely usable and grants nothing here — see
@@ -53,11 +59,14 @@ usbipd-mac is a macOS implementation of the USB/IP protocol that allows sharing 
 - USB device sharing from macOS to other systems over network
 - Compatible with the standard Linux `usbip` client — verified with a real client
   performing enumeration, control transfers and bulk transfers
+- Works with [usbip-win2](https://github.com/vadimgrn/usbip-win2) on Windows — verified
+  with a USB BD-RE drive, a disc read end to end
 - Every interface of a device is served: control, bulk, interrupt and isochronous
   transfers (isochronous needs macOS 12), alternate settings and configurations,
   SuperSpeed and SuperSpeed+ speeds
 - Devices macOS holds are captured from its drivers when a client attaches, as root,
-  and handed back when it detaches
+  and handed back when it detaches; mass storage too, with Full Disk Access
+- `USBIPD_TRACE` logs every request and reply, to see what a client and a device said
 - No System Extension or entitlement required
 
 ## Requirements
@@ -71,7 +80,11 @@ usbipd-mac is a macOS implementation of the USB/IP protocol that allows sharing 
 
 ### Homebrew Installation (Recommended)
 
-The easiest way to install usbipd-mac is through Homebrew:
+The easiest way to install usbipd-mac is through Homebrew. The formula installs the
+latest release, which does not have the changes listed under Unreleased in
+[CHANGELOG.md](CHANGELOG.md) — capturing held devices, mass storage, usbip-win2 support
+among them. To use those, build from source (see
+[Building the Project](#building-the-project)).
 
 ```bash
 # Add the usbip tap
@@ -119,11 +132,12 @@ resolves extensions inside the *calling process's own* bundle and requires that 
 to live in `/Applications`, which a Homebrew-installed binary is not. Its device-claiming
 strategy was also measured not to unbind anything.
 
-What that leaves is honest and unchanged in practice: devices macOS has not bound a
-driver to are served, and devices whose interfaces it holds are refused by `bind`, which
-names the owner. Changing the second group needs a DriverKit entitlement Apple must
-grant, and an app bundle to activate it from. See
-[Documentation/development/driver-free-release.md](Documentation/development/driver-free-release.md).
+Devices macOS has not bound a driver to are served as they are. Devices whose
+interfaces it holds are no longer refused: the daemon captures them from their drivers
+when a client attaches, which IOUSBHost lets root do without any entitlement (see the
+note at the top). See
+[Documentation/development/driver-free-release.md](Documentation/development/driver-free-release.md)
+for the history.
 
 
 #### Troubleshooting Homebrew Installation
@@ -134,24 +148,37 @@ Common installation issues and solutions:
 - **Service Won't Start**: Verify the binary installed correctly with `which usbipd` and check logs with `brew services list`
 - **Version Issues**: Update with `brew upgrade usbip` or reinstall with `brew reinstall usbip`
 
-#### If a device will not bind
+#### What `bind` says about a device macOS holds
 
-`bind` names what owns the device:
-
-```
-$ usbipd bind 1-19
-Cannot share 1-19: macOS has bound a driver to it (AppleUserHIDDevice).
-```
-
-That is a dead end without a DriverKit entitlement — seizing the interface was measured
-and does not work, and neither unmounting nor ejecting releases a device.
+`bind` no longer refuses a device that a macOS driver or another process holds. It
+offers it, and says what attaching it will take from macOS. For a USB BD-RE drive:
 
 ```
-$ usbipd bind 1-20
-Cannot share 1-20: another process has it open (AppleUSBHostFrameworkInterfaceClient).
+$ usbipd bind 1-1
+Note: macOS has bound drivers to 1-1 (IOUSBMassStorageInterfaceNub).
+When a client attaches, the daemon takes the device from them and gives it
+back when the client detaches. Taking it needs the daemon to run as root
+(sudo brew services start usbip).
+
+It is a storage device:
+- Eject its volumes before attaching. Taking it would cut them off
+  unflushed, so the daemon refuses while one is mounted.
+- macOS opens a storage interface only to a process with Full Disk
+  Access, and goes by the app the daemon was started from. Grant it in
+  System Settings > Privacy & Security > Full Disk Access to the
+  terminal app you start the daemon from. A daemon started over SSH
+  is refused. Started at boot, as brew services does, the daemon
+  would need the grant itself, which has not been tested.
+`sudo usbipd probe 1-1` checks both without a client.
+✓ Device 1-1 added to server configuration
+Bound device 1-1: 18a5:0428 (Verbatim 4K BD RW)
+Registered for USB/IP sharing. macOS keeps the device until a client attaches.
 ```
 
-That one is fixable: quit the app holding the device and bind again.
+A device another process has open is offered the same way; the capture terminates that
+process's hold on it too. `sudo usbipd probe <busid>` opens a device exactly as an
+attach would, prints what that took from macOS and which interfaces and endpoints
+opened, and gives the device back, so you can find out without a client.
 
 To check hardware before buying or debugging, `./Scripts/validate-usb-entitlements.sh`
 reports which of your attached devices are claimable and which are owned.
@@ -178,6 +205,16 @@ usbipd status
 
 # Stop sharing a device
 usbipd unbind <busid>
+
+# Run the daemon in the foreground, as root (for storage devices, from a terminal app
+# that has Full Disk Access)
+sudo usbipd daemon -f
+
+# Open a device as an attach would, report what that took, and give it back
+sudo usbipd probe <busid>
+
+# Write a codeless kext that keeps macOS's drivers off a device (a fallback; needs SIP off)
+usbipd kext <busid>
 ```
 
 
@@ -198,6 +235,46 @@ usbip port
 # Detach device
 sudo usbip detach -p <port-number>
 ```
+
+From Windows, with [usbip-win2](https://github.com/vadimgrn/usbip-win2) (its `usbip.exe`
+is in `C:\Program Files\USBip`; its GUI, wusbip, does the same):
+
+```powershell
+# Connect to a shared device
+usbip.exe attach -r <macos-ip-address> -b <busid>
+
+# List attached devices
+usbip.exe port
+
+# Detach a device
+usbip.exe detach -p <port-number>
+```
+
+### Storage devices over a network
+
+A storage client sends one SCSI command at a time, and each takes three USB/IP round
+trips — the command block, the data and the status — each waiting for the one before.
+So the network's round-trip time, not the device or the daemon, usually sets the pace.
+Measured with a USB BD-RE drive attached to Windows over Wi-Fi: the drive answered each
+transfer in about a millisecond, the daemon added nothing measurable, and the round
+trips took a median of 9 ms each. A link with shorter round trips, such as a wired one,
+should help more than anything on the Mac can.
+
+On Windows, an Explorer window open on an optical drive makes Explorer ask the drive
+for its features about 34 times a second. Locally that goes unnoticed; over the network
+it took most of the link. Closing the window made reads several times faster.
+
+### Seeing what a client and a device said
+
+Set `USBIPD_TRACE` in the daemon's environment to log every request, every request the
+daemon carried out itself, every completion with its IOReturn, and every reply. Writing
+the log to a file keeps a terminal's scrollback out of the daemon's way:
+
+```bash
+sudo USBIPD_TRACE=1 usbipd daemon -f > /tmp/usbipd-trace.log 2>&1
+```
+
+It writes several lines for every transfer, so leave it off when you are not looking.
 
 ### Docker Integration
 
@@ -225,6 +302,10 @@ swift build
 
 # Build with Xcode (recommended for development)
 xcodebuild -scheme usbipd-mac build
+
+# Build a release binary and run the daemon from it
+swift build -c release
+sudo .build/release/usbipd daemon -f
 ```
 
 
@@ -237,6 +318,9 @@ swift test
 # Run specific test environments (see Documentation for details)
 swift test --parallel                 # Run the test suite
 ```
+
+If `xcode-select` points at the Command Line Tools, which have no XCTest, run the suite
+against Xcode: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`.
 
 ## Documentation
 

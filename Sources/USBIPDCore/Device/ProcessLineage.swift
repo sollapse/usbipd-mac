@@ -8,8 +8,10 @@ import Darwin
 ///
 /// Full Disk Access belongs to apps, and a command-line tool gets it from the app it was
 /// started from: the terminal it runs in, through sudo and the shell. When the check
-/// refuses, naming that app tells the user what to grant it to. A daemon started at boot
-/// has no such app and needs the grant itself.
+/// refuses, naming that app tells the user what to grant it to. A daemon started over SSH
+/// has no such app, and was refused even though the session could read protected files.
+/// A daemon started at boot has none either and should need the grant itself; that has
+/// not been tested.
 public enum ProcessLineage {
     /// Executable names from this process up to, not including, launchd.
     public static func chain(from pid: pid_t = getpid()) -> [String] {

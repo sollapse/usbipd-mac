@@ -124,7 +124,9 @@ public class TCPClientConnection: ClientConnection {
     private func startReceiving() {
         logger.debug("Starting to receive data", context: ["connectionId": id.uuidString])
         
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+        // Up to 1 MiB a read: a write of a few hundred kilobytes, as storage clients
+        // send, arrives in a few reads rather than dozens.
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
             
             if let error = error {

@@ -7,6 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — devices macOS holds are served, mass storage included
+
+`bind` refused any device a macOS driver or another process held — HID, mass storage,
+audio, cameras, CDC-ACM — because nothing could release one. IOUSBHost lets root
+*capture* a device, without the DriverKit entitlement Apple refused this project: the
+drivers and clients on it are terminated, and when the client detaches the device is
+reset and handed back to them. `bind` now offers such a device and says what attaching
+it will take from macOS, and the daemon captures it when a client attaches. That needs
+the daemon to run as root.
+
+Mass storage took two more steps, measured with a USB BD-RE drive (18a5:0428) on
+macOS 27.0.1:
+
+- A capture terminates the storage driver, but the interface node it was on can stay
+  behind with the driver found back on it. The daemon selects configuration 0 and then
+  the current one again, unmatched, which gives a fresh interface nothing has claimed.
+- macOS opens a storage interface only to a process with Full Disk Access, and fails
+  the open with `kIOReturnInternalError` otherwise. It goes by the app the daemon was
+  started from: a daemon started with `sudo` from Terminal opened the drive, and one
+  started with `sudo` over SSH was refused, although the SSH session could read files
+  Full Disk Access protects. The error names the processes the daemon was started
+  from and what to do.
+
+A device whose volumes are mounted is refused rather than captured, since a capture
+would cut them off unflushed. With this the drive was attached to Windows 11 through
+usbip-win2 0.9.8.1, and a disc in it read.
+
+### Added — `usbipd probe` and `usbipd kext`
+
+`sudo usbipd probe <busid>` opens a device the way an attach does — as it is if nothing
+holds it, captured otherwise — and prints each step: what was attached to each interface
+before and after the capture, each configuration selection, and each failed open. Then
+it gives the device back. It tells you what attaching will do to a given device on a
+given macOS release, without a USB/IP client.
+
+`usbipd kext <busid>...` writes `usbipd-claim.kext`, a kext with no code whose
+personalities out-match macOS's class drivers on the given devices' interfaces. It is a
+fallback for an interface a capture does not release; the BD-RE drive did not need it.
+Loading it needs System Integrity Protection off, and it has not been loaded.
+
+### Fixed — a TCP read was taken as one whole message
+
+The connection handed each TCP read to the request processor as exactly one message. A
+bulk OUT larger than one read arrived in pieces, each decoded as a message of its own,
+and URBs a client wrote back to back were lost after the first. Small request/response
+traffic happened to arrive one message per read, which is why the probes validated
+before worked; a mass storage device would not have survived its first write. Messages
+are now framed from their headers, payloads and isochronous descriptors included, and a
+header that cannot start a valid message closes the connection.
+
+### Fixed — an attached device was served through one interface, one transfer at a time
+
+The transfer path opened the first interface IOKit listed and sent every transfer there.
+It found the device by vendor and product ID, so two identical devices could not be told
+apart, and ran each transfer as a blocking call. It passed SET_CONFIGURATION,
+SET_INTERFACE and CLEAR_FEATURE(ENDPOINT_HALT) to the device as raw bytes, which left
+the host's own state behind: after clearing a halt that way, the host's endpoint stayed
+halted and every later transfer failed.
+
+An imported device is now served through IOUSBHost and found by its busid: every
+interface of the current configuration, every endpoint of the selected alternate
+settings, any number of URBs in flight, and each endpoint in order. The requests that
+change the host's state are carried out by the host. A CMD_UNLINK is answered once its
+abort completes. Other requests caught up in the same endpoint abort are queued again
+instead of being answered with ECONNRESET, which Linux drivers take as their own
+unlink. Every reply goes out from one queue, so a RET_UNLINK can no longer overtake its
+RET_SUBMIT, the order that makes Linux's vhci detach the device. A device that cannot be
+served is refused at import, with the reason in the daemon's log, and when the client
+disconnects the device goes back to macOS.
+
+### Fixed — a STALL was reported as a protocol error
+
+IOUSBHost reports a stalled endpoint as `kUSBHostReturnPipeStalled` (0xe0005000), not
+IOUSBLib's `kIOUSBPipeStalled`, so a stall went out as EPROTO. Storage devices stall as a
+matter of course: with no disc in it, the BD-RE drive stalled the data phase of the
+storage driver's third command. Windows, never told it was a stall, did not clear it or
+read the status, every later command timed out, and USBSTOR gave up with code 10. A
+stall is now EPIPE, and the host's side is left for the client to clear, as Linux's
+server leaves it.
+
+### Fixed — isochronous transfers
+
+Isochronous calls passed no completion callback and freed their buffers while the
+transfer was still pending. Neither SUBMIT message knew about the per-packet descriptors
+that follow an isochronous request, so an IN request's descriptors were read as data.
+Isochronous transfers are now IOUSBHost transaction lists, one transaction per packet
+(macOS 12 and later), with each packet's length and status in the reply. The
+descriptors are decoded at any alignment; they follow the data, so they can start at an
+odd offset. A request whose packet lengths add up past the transfer limit is refused;
+three packets of 0xffffffff bytes used to trap a daemon running as root. None of this
+has been validated on hardware yet.
+
+### Fixed — SuperSpeed devices were advertised as Wireless USB
+
+USB/IP carries Linux's `enum usb_device_speed`, where 4 is Wireless USB, 5 SuperSpeed
+and 6 SuperSpeed+. This project's own enum values went out instead, so a Linux client
+attached a SuperSpeed device to vhci's high-speed hub, and SuperSpeed+ went out as 0.
+They now go out as 5 and 6.
+
+### Fixed — every device was described as one interface of unknown class
+
+Device lists and import replies gave every device one configuration and one interface
+of unknown class, so `usbip list -r` showed "(Defined at Interface level)" for all of
+them. They now carry each device's current configuration and each interface's class.
+
+### Changed — replies go out without waiting
+
+The listener sets TCP_NODELAY, as Linux's usbip tools do. With Nagle's algorithm, the
+short last segment of a large reply, such as a 64 KiB read, waited for the client to
+acknowledge the segments before it. A connection now reads up to 1 MiB at a time instead
+of 64 KiB, and IOUSBHost's transfer buffers are reused instead of being mapped for every
+transfer.
+
+### Added — `USBIPD_TRACE`
+
+Setting `USBIPD_TRACE` in the daemon's environment logs every CMD_SUBMIT and
+CMD_UNLINK, every request carried out on the host, every completion with its IOReturn
+and every reply. An import logs how the device was opened, step by step, as
+`usbipd probe` prints it.
+
+### Measured — a storage device over a network
+
+Every SCSI command a storage client sends takes three USB/IP round trips — the command
+block, the data and the status — and each waits for the one before. With the BD-RE drive
+attached to Windows over Wi-Fi, the drive answered each transfer in about a millisecond
+and the daemon added nothing measurable. The round trips, at a median of 9 ms each, set
+the pace. An Explorer window open on the drive made Explorer ask the drive for its
+features about 34 times a second, which took most of the link: closing the window made
+reads several times faster.
+
+### Known limitations
+
+- Isochronous and interrupt transfers, the claim kext, and capturing HID, audio, camera
+  and CDC-ACM devices have not been validated on hardware.
+- A Full Disk Access grant to the `usbipd` binary itself, which a daemon started at boot
+  would need, has not been tested. A locally built binary is ad hoc signed, so macOS
+  would tie such a grant to that one build.
+
 ### Removed — the System Extension subsystem
 
 Some 24,000 lines that no shipping path could reach, and a release artifact no

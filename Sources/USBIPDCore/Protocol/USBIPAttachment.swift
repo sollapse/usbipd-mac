@@ -101,6 +101,8 @@ public final class USBIPAttachment: @unchecked Sendable {
         var withdrawnBy: UInt32?
         /// The buffer an IN reply's data is read from.
         var buffer: NSMutableData?
+        /// The buffer an OUT transfer's data went out from.
+        var outBuffer: NSMutableData?
         /// An OUT followed by a zero-length packet whose data part has not completed.
         var awaitingDataPart = false
         /// The data part's byte count, once it has completed.
@@ -183,6 +185,15 @@ public final class USBIPAttachment: @unchecked Sendable {
             return
         }
 
+        trace("CMD_SUBMIT seq \(request.seqnum) ep \(request.ep) \(request.direction == 1 ? "in" : "out") "
+              + "length \(request.transferBufferLength) flags \(String(format: "0x%x", request.transferFlags))"
+              + (request.ep & 0x0F == 0 ? " setup \(request.setup.map { String(format: "%02x", $0) }.joined())" : "")
+              + (request.isoPackets.isEmpty ? "" : " packets \(request.isoPackets.count)")
+              // What goes out matters as much as what comes back: a storage command
+              // block is 31 bytes, and its operation code is what says what the client
+              // asked the device to do.
+              + (request.transferBuffer.map { " data \($0.prefix(32).map { String(format: "%02x", $0) }.joined())" } ?? ""))
+
         guard Int(request.transferBufferLength) <= maxTransferSize else {
             logger.warning("Refusing a \(request.transferBufferLength)-byte transfer, above the limit of \(maxTransferSize)")
             reply(to: request, status: -LinuxErrno.einval)
@@ -239,6 +250,7 @@ public final class USBIPAttachment: @unchecked Sendable {
         }
 
         if let status = carryOut(setup) {
+            trace("seq \(request.seqnum) carried out here: status \(status)")
             reply(to: request, status: status)
             return
         }
@@ -269,8 +281,18 @@ public final class USBIPAttachment: @unchecked Sendable {
             // CLEAR_FEATURE(ENDPOINT_HALT). The device's side with the request itself,
             // then the host's, in the order Linux's usb_clear_halt uses.
             let endpoint = UInt8(truncatingIfNeeded: setup.wIndex)
-            if let failure = status({ _ = try io.sendControl(setup, data: nil) }), failure != 0 {
-                return failure
+            do {
+                _ = try io.sendControl(setup, data: nil)
+            } catch {
+                // The device answering is the device's business, and is passed on. A
+                // refusal by the host stack itself is not: clearing the host's side
+                // below is what IOUSBHost wants instead, so it goes ahead.
+                let result = ioReturn(from: error)
+                if !USBIPTransferStatus.isHostRefusal(result) {
+                    logger.info("\(busid): clearing the halt on \(String(format: "0x%02x", endpoint)): \(error)")
+                    return USBIPTransferStatus.urbStatus(for: result)
+                }
+                trace("the host refused CLEAR_FEATURE as a request (\(USBIOReturn.describe(result))); clearing its side only")
             }
             resetHostSide(of: endpoint)
             return 0
@@ -304,6 +326,9 @@ public final class USBIPAttachment: @unchecked Sendable {
         lastGeneration += 1
         entry.generation = lastGeneration
         let generation = lastGeneration
+        // Buffers are made for each attempt; an earlier attempt's went back to the pool.
+        entry.buffer = nil
+        entry.outBuffer = nil
 
         do {
             switch entry.transferType {
@@ -349,6 +374,7 @@ public final class USBIPAttachment: @unchecked Sendable {
             entry.buffer = buffer
         } else if let payload = request.transferBuffer, !payload.isEmpty {
             buffer = outBuffer(payload)
+            entry.outBuffer = buffer
         } else {
             buffer = nil
         }
@@ -394,6 +420,7 @@ public final class USBIPAttachment: @unchecked Sendable {
         if inbound {
             entry.buffer = buffer
         } else {
+            entry.outBuffer = buffer
             let payload = request.transferBuffer ?? Data()
             for (packet, transaction) in zip(request.isoPackets, transactions) where packet.length > 0 {
                 let start = Int(packet.offset)
@@ -444,6 +471,7 @@ public final class USBIPAttachment: @unchecked Sendable {
 
     private func unlink(_ message: Data) {
         guard let request = try? USBIPUnlinkRequest.decode(from: message) else { return }
+        trace("CMD_UNLINK seq \(request.seqnum) for seq \(request.unlinkSeqnum)")
 
         guard var entry = inFlight[request.unlinkSeqnum], entry.withdrawnBy == nil else {
             // Already answered. Linux's server says so with status 0; the RET_SUBMIT
@@ -519,6 +547,7 @@ public final class USBIPAttachment: @unchecked Sendable {
     // MARK: - Completion
 
     private func completed(_ seqnum: UInt32, generation: UInt64, result: IOReturn, transferred: Int) {
+        trace("seq \(seqnum) completed: \(USBIOReturn.describe(result)), \(transferred) bytes")
         // A completion from an earlier attempt, or from the zero-length packet of one
         // already set aside to be queued again, belongs to nothing current.
         guard !isClosed, var entry = inFlight[seqnum], entry.generation == generation,
@@ -540,9 +569,11 @@ public final class USBIPAttachment: @unchecked Sendable {
 
         if let unlinkSeqnum = entry.withdrawnBy {
             sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
+            recycleBuffers(of: &entry)
         } else if result == USBIOReturn.aborted && wasDraining && transferred == 0 && entry.dataPartTransferred == nil {
             // Caught up in another request's abort, with nothing transferred: queued
             // again once the endpoint has drained.
+            recycleBuffers(of: &entry)
             entry.stage = .awaitingResubmit
             inFlight[seqnum] = entry
         } else {
@@ -550,12 +581,26 @@ public final class USBIPAttachment: @unchecked Sendable {
             let dataDone = entry.dataPartTransferred
             let finalResult = dataDone != nil && result == USBIOReturn.aborted ? kIOReturnSuccess : result
             reply(to: entry, result: finalResult, transferred: dataDone ?? transferred)
+            recycleBuffers(of: &entry)
 
             if entry.transferType != .control && USBIPTransferStatus.needsHostSideReset(after: result) {
                 resetHostSide(of: entry.endpoint)
             }
         }
         finishDraining(entry.endpoint)
+    }
+
+    /// Give a finished attempt's buffers back for other transfers. Only once IOKit has
+    /// completed the request and the reply has been built from them.
+    private func recycleBuffers(of entry: inout InFlightURB) {
+        if let buffer = entry.buffer {
+            io.recycle(buffer)
+        }
+        if let buffer = entry.outBuffer {
+            io.recycle(buffer)
+        }
+        entry.buffer = nil
+        entry.outBuffer = nil
     }
 
     private func completedIsochronous(_ seqnum: UInt32, generation: UInt64, result: IOReturn,
@@ -568,11 +613,14 @@ public final class USBIPAttachment: @unchecked Sendable {
         let transferredAny = completed.contains { $0.completeCount > 0 }
         if let unlinkSeqnum = entry.withdrawnBy {
             sendUnlinkReply(seqnum: unlinkSeqnum, devid: entry.request.devid, status: -LinuxErrno.econnreset)
+            recycleBuffers(of: &entry)
         } else if result == USBIOReturn.aborted && wasDraining && !transferredAny {
+            recycleBuffers(of: &entry)
             entry.stage = .awaitingResubmit
             inFlight[seqnum] = entry
         } else {
             replyIsochronous(to: entry, result: result, completed: completed)
+            recycleBuffers(of: &entry)
         }
         finishDraining(entry.endpoint)
     }
@@ -652,6 +700,7 @@ public final class USBIPAttachment: @unchecked Sendable {
     }
 
     private func sendUnlinkReply(seqnum: UInt32, devid: UInt32, status: Int32) {
+        trace("RET_UNLINK seq \(seqnum) status \(status)")
         let response = USBIPUnlinkResponse(seqnum: seqnum, devid: devid, direction: 0, ep: 0, status: status)
         if let data = try? response.encode() {
             send(data)
@@ -659,10 +708,22 @@ public final class USBIPAttachment: @unchecked Sendable {
     }
 
     private func deliver(_ response: USBIPSubmitResponse) {
+        trace("RET_SUBMIT seq \(response.seqnum) status \(response.status) length \(response.actualLength)"
+              + (response.transferBuffer.map { " data \($0.prefix(16).map { String(format: "%02x", $0) }.joined())" } ?? ""))
         do {
             send(try response.encode())
         } catch {
             logger.error("Could not encode a reply for seqnum \(response.seqnum): \(error)")
+        }
+    }
+
+    /// Whether every URB is logged: set USBIPD_TRACE in the daemon's environment to see
+    /// what a device's client asks for and what comes back.
+    private static let tracing = ProcessInfo.processInfo.environment["USBIPD_TRACE"] != nil
+
+    private func trace(_ message: @autoclosure () -> String) {
+        if Self.tracing {
+            logger.info("\(busid): \(message())")
         }
     }
 }

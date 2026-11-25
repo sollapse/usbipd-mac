@@ -57,29 +57,40 @@ already received that announcement; attaching from a client causes no bus reset 
 phone can observe. Request/response devices are unaffected. See
 `Documentation/development/android-adb-validation.md`.
 
-**Devices macOS holds are captured, not refused — unvalidated on hardware.** HID,
-audio, cameras, CDC-ACM and mass storage are taken from macOS when a client attaches
-them: `IOUSBHostDeviceIO` opens the device through IOUSBHost and, when a driver holds
-an interface, recreates it with `IOUSBHostObjectInitOptionsDeviceCapture`, which root
-may use without the `com.apple.vm.device-access` entitlement. The drivers are
-terminated; destroying the device on detach resets it and lets them match again.
-`USBInterfaceOpenSeize` (measured, 2026-08-06) does not release a driver and neither
-unmounting nor ejecting does; capture is a different operation. `bind` no longer
-refuses held devices, it says what attaching will take. `sudo usbipd probe <busid>`
-opens a device exactly as an attach does.
+**Devices macOS holds are captured, not refused — validated on hardware for mass
+storage only.** HID, audio, cameras, CDC-ACM and mass storage are taken from macOS
+when a client attaches them: `IOUSBHostDeviceIO` opens the device through IOUSBHost
+and, when a driver holds an interface, recreates it with
+`IOUSBHostObjectInitOptionsDeviceCapture`, which root may use without the
+`com.apple.vm.device-access` entitlement. The drivers are terminated; destroying the
+device on detach resets it and lets them match again. `USBInterfaceOpenSeize`
+(measured, 2026-08-06) does not release a driver and neither unmounting nor ejecting
+does; capture is a different operation. `bind` no longer refuses held devices, it says
+what attaching will take. `sudo usbipd probe <busid>` opens a device exactly as an
+attach does.
 
 Mass storage works, measured on macOS 27.0.1 (M4 Mac mini) with a USB BD-RE drive
-(18a5:0428) through `sudo usbipd probe`. Three things it took:
+(18a5:0428): first through `sudo usbipd probe`, then end to end, attached to Windows 11
+through usbip-win2 0.9.8.1 with a disc read. Four things it took:
 - **Capture terminates the storage driver.** The old interface node stays behind.
   Without a fresh selection the driver can be found back on it; selecting
   configuration 0, then the current one with `matchInterfaces: false`, gives a new
   interface node with nothing on it.
 - **The Full Disk Access check.** That interface then opens only for a process with
   Full Disk Access. Without it, the open fails with `kIOReturnInternalError`, which
-  root does not get past.
+  root does not get past. The check goes by the app the daemon was started from:
+  `sudo` in Terminal passes; `sudo` over SSH was refused although the SSH session could
+  read protected files. `ProcessLineage` names the chain in the error. A grant on the
+  binary itself, which a daemon started at boot would need, is untested, and a local
+  build's ad hoc signature would tie it to that one build.
 - **`kIOReturnInternalError` while the driver is still attached.** That is also what
   macOS 27 returns before capture, rather than `kIOReturnExclusiveAccess`. So a driver
   attached to an interface is what marks it held.
+- **IOUSBHost's own stall code.** A stalled endpoint completes with
+  `kUSBHostReturnPipeStalled` (0xe0005000), not IOUSBLib's `kIOUSBPipeStalled`
+  (0xe000404f). Both must become EPIPE: as EPROTO, Windows never cleared the halt or
+  read the status, and USBSTOR failed the device with code 10. A drive with no disc
+  stalls as a matter of course.
 
 `usbipd probe` prints each step: interface registry IDs and attached drivers before
 and after. A device with mounted volumes is refused rather than captured.
@@ -121,10 +132,23 @@ read was taken as exactly one message. The older `USBRequestHandler` /
 `USBSubmitProcessor` / `IOKitUSBInterface` pipeline is now reached only by unit tests
 that build a `RequestProcessor` without an attachment opener.
 
-**Untested on hardware.** Everything in the paragraph above, interrupt endpoints and
-isochronous streams in particular. `USBIPAttachmentTests` drive the attachment against
-a recording device. See `Documentation/development/probe-rs-validation.md` for how
-interop was validated before.
+**Validated on hardware for bulk and control transfers only.** The BD-RE drive went
+through all of the above that bulk-only storage uses: capture, control and bulk
+transfers, stalls and CLEAR_FEATURE(ENDPOINT_HALT) (which IOUSBHost refuses as a raw
+control request, 0xe00002e2, so the attachment clears the stall through the pipe's
+`clearStall` instead), and handing the device back. Interrupt
+endpoints and isochronous streams have not been on hardware. `USBIPAttachmentTests`
+drive the attachment against a recording device. See
+`Documentation/development/probe-rs-validation.md` for how interop was validated before.
+
+**Tracing and the network.** `USBIPD_TRACE` in the daemon's environment logs every
+URB: CMD_SUBMIT and CMD_UNLINK, requests carried out on the host, completions with
+their IOReturn, replies. Each line is timestamped, so a trace shows where time goes.
+For the BD-RE drive over Wi-Fi, the drive answered in about a millisecond, the daemon
+added nothing, and the client's round trips (three per SCSI command) set the pace. The
+listener sets TCP_NODELAY, and `IOUSBHostDeviceIO` pools transfer buffers by size: the
+attachment hands each one back through `recycle` once its transfer has completed and
+the reply has been copied out.
 
 The **SystemExtension subsystem was removed in 0.7.0** — some 24,000 lines that no
 shipping path could reach. `OSSystemExtensionRequest` resolves extensions inside the

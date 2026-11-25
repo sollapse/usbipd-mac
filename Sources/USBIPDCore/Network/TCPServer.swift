@@ -82,7 +82,14 @@ public class TCPServer: NetworkService {
             throw NetworkError.bindFailed("Invalid port number: \(port)")
         }
         
-        let parameters = NWParameters.tcp
+        // USB/IP is request and reply in small messages: a storage command is a 31-byte
+        // command block, its data, and a 13-byte status, each answered before the client
+        // sends the next. With Nagle's algorithm on, a small reply waits for the ACK of
+        // the one before it, which delayed ACK holds back, so every command paid that
+        // wait two or three times. Linux's usbip and usbipd-win set TCP_NODELAY too.
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         parameters.allowLocalEndpointReuse = true
         
         do {

@@ -93,6 +93,10 @@ public protocol USBDeviceIO: AnyObject {
     /// A buffer for a transfer of this many bytes.
     func makeBuffer(length: Int) -> NSMutableData
 
+    /// Hand back a buffer from `makeBuffer` once the transfer that used it has completed
+    /// and nothing reads it any more, so it can serve another transfer.
+    func recycle(_ buffer: NSMutableData)
+
     /// Queue a request on the default control endpoint.
     func enqueueControl(_ setup: USBSetupPacket, data: NSMutableData?,
                         completion: @escaping @Sendable (IOReturn, Int) -> Void) throws
@@ -127,6 +131,11 @@ public protocol USBDeviceIO: AnyObject {
 
     /// Abort everything and give the device back to macOS.
     func close()
+}
+
+public extension USBDeviceIO {
+    /// Devices that do not pool buffers let them go.
+    func recycle(_ buffer: NSMutableData) {}
 }
 
 /// How the device layer refuses an operation, as an IOReturn.
@@ -165,6 +174,13 @@ public enum USBIOReturn {
     public static let isoTooOld = IOReturn(bitPattern: 0xE000_02F0)
     public static let isoTooNew = IOReturn(bitPattern: 0xE000_02F1)
     public static let pipeStalled = IOReturn(bitPattern: 0xE000_404F)
+    /// kUSBHostReturnPipeStalled: how IOUSBHost reports a STALL. The IOUSBLib code above
+    /// is never what an IOUSBHostPipe returns.
+    public static let hostPipeStalled = IOReturn(bitPattern: 0xE000_5000)
+    /// kUSBHostReturnNoPower: no configuration fits the power available.
+    public static let hostNoPower = IOReturn(bitPattern: 0xE000_5001)
+    /// kUSBHostReturnRedundant: the setting asked for is already in effect.
+    public static let hostRedundant = IOReturn(bitPattern: 0xE000_5002)
     public static let transactionTimeout = IOReturn(bitPattern: 0xE000_4051)
     public static let crcError = IOReturn(bitPattern: 0xE000_4001)
     public static let bitstuffError = IOReturn(bitPattern: 0xE000_4002)
@@ -209,8 +225,13 @@ public enum USBIPTransferStatus {
         case USBIOReturn.success, USBIOReturn.underrun:
             // A short read is a successful one; URB_SHORT_NOT_OK is applied separately.
             return 0
-        case USBIOReturn.pipeStalled:
+        case USBIOReturn.pipeStalled, USBIOReturn.hostPipeStalled:
+            // A storage device stalls its bulk-in endpoint in the ordinary course of
+            // things. Reported as anything but EPIPE, the client never clears the halt,
+            // never reads the status, and every command after it times out.
             return -LinuxErrno.epipe
+        case USBIOReturn.hostNoPower:
+            return -LinuxErrno.eshutdown
         case USBIOReturn.aborted:
             return -LinuxErrno.econnreset
         case USBIOReturn.timeout, USBIOReturn.transactionTimeout:
@@ -250,6 +271,17 @@ public enum USBIPTransferStatus {
         }
     }
 
+    /// Whether the host's software refused a request without it reaching the bus.
+    public static func isHostRefusal(_ result: IOReturn) -> Bool {
+        switch result {
+        case USBIOReturn.badArgument, USBIOReturn.notPermitted, USBIOReturn.unsupported,
+             USBIOReturn.exclusiveAccess, USBIOReturn.notOpen, USBIOReturn.hostRedundant:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Whether a failed bulk or interrupt transfer left the host's side of the endpoint
     /// halted with nothing on the client's side to clear it.
     ///
@@ -260,9 +292,9 @@ public enum USBIPTransferStatus {
     /// nothing, so the server has to.
     public static func needsHostSideReset(after result: IOReturn) -> Bool {
         switch result {
-        case USBIOReturn.success, USBIOReturn.underrun, USBIOReturn.pipeStalled,
+        case USBIOReturn.success, USBIOReturn.underrun, USBIOReturn.pipeStalled, USBIOReturn.hostPipeStalled,
              USBIOReturn.aborted, USBIOReturn.timeout, USBIOReturn.transactionTimeout,
-             USBIOReturn.noDevice,
+             USBIOReturn.noDevice, USBIOReturn.hostNoPower, USBIOReturn.hostRedundant,
              // Refusals by the software, which never reached the bus.
              USBIOReturn.badArgument, USBIOReturn.notPermitted, USBIOReturn.unsupported,
              USBIOReturn.exclusiveAccess, USBIOReturn.notOpen:

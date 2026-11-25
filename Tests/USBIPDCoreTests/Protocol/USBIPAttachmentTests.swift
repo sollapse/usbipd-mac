@@ -30,9 +30,19 @@ private final class RecordingDeviceIO: USBDeviceIO, @unchecked Sendable {
     private(set) var closed = false
     var controlResult: IOReturn = kIOReturnSuccess
 
+    private(set) var madeBuffers: [NSMutableData] = []
+    private(set) var recycled: [ObjectIdentifier] = []
+
     func endpoint(_ address: UInt8) -> USBEndpointInfo? { endpoints[address] }
     var currentConfiguration: UInt8? { configuration }
-    func makeBuffer(length: Int) -> NSMutableData { NSMutableData(length: length)! }
+    func makeBuffer(length: Int) -> NSMutableData {
+        let buffer = NSMutableData(length: length)!
+        lock.lock(); madeBuffers.append(buffer); lock.unlock()
+        return buffer
+    }
+    func recycle(_ buffer: NSMutableData) {
+        lock.lock(); recycled.append(ObjectIdentifier(buffer)); lock.unlock()
+    }
 
     func enqueueControl(_ setup: USBSetupPacket, data: NSMutableData?,
                         completion: @escaping @Sendable (IOReturn, Int) -> Void) throws {
@@ -206,6 +216,28 @@ final class USBIPAttachmentTests: XCTestCase {
         XCTAssertEqual(replies.submits.map(\.status), [-32])
         // A stall is the client's to clear.
         XCTAssertTrue(device.clearedHalts.isEmpty)
+    }
+
+    /// IOUSBHost reports a STALL as kUSBHostReturnPipeStalled (0xe0005000), not IOUSBLib's
+    /// code. Reported as EPROTO, a storage device's ordinary data-phase stall was never
+    /// cleared, its status never read, and every later command timed out.
+    func testIOUSBHostStallIsReportedAsEPIPE() {
+        submit(1, ep: 1, direction: 1, length: 8)
+        complete(0, USBIOReturn.hostPipeStalled, 0)
+        XCTAssertEqual(replies.submits.map(\.status), [-32])
+        XCTAssertTrue(device.clearedHalts.isEmpty)
+    }
+
+    /// The client then clears it: the device's side by request, the host's by reset,
+    /// after which the status is read.
+    func testStallClearedByTheClientLetsTheStatusThrough() {
+        submit(1, ep: 1, direction: 1, length: 8)
+        complete(0, USBIOReturn.hostPipeStalled, 0)
+        submit(2, ep: 0, direction: 0, length: 0, setup: [0x02, 0x01, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00])
+        XCTAssertEqual(device.clearedHalts, [0x81])
+        submit(3, ep: 1, direction: 1, length: 13)
+        complete(1, kIOReturnSuccess, 13)
+        XCTAssertEqual(replies.submits.map(\.status), [-32, 0, 0])
     }
 
     /// Transaction errors halt IOUSBHost's endpoint, and a Linux client expects its host
@@ -439,6 +471,31 @@ final class USBIPAttachmentTests: XCTestCase {
         submit(1, ep: 3, direction: 1, length: 0, packets: packets)
         XCTAssertTrue(device.pending.isEmpty)
         XCTAssertEqual(replies.submits.map(\.status), [-22])
+    }
+
+    // MARK: - Buffers
+
+    /// Every buffer goes back once, and only after its transfer has completed: twice, and
+    /// two transfers would share it.
+    func testEachBufferIsRecycledOnceAfterItsTransfer() {
+        submit(1, ep: 1, direction: 1, length: 512)
+        submit(2, ep: 2, direction: 0, length: 4, payload: Data([1, 2, 3, 4]))
+        XCTAssertTrue(device.recycled.isEmpty, "nothing goes back while in flight")
+        complete(0, kIOReturnSuccess, 512)
+        complete(1, kIOReturnSuccess, 4)
+
+        // An abort: one request withdrawn, one queued again with a fresh buffer.
+        submit(3, ep: 1, direction: 1, length: 512)
+        submit(4, ep: 1, direction: 1, length: 512)
+        unlink(5, target: 3)
+        complete(2, USBIOReturn.aborted, 0)
+        complete(3, USBIOReturn.aborted, 0)
+        complete(4, kIOReturnSuccess, 512)
+
+        let made = device.madeBuffers.map(ObjectIdentifier.init)
+        XCTAssertEqual(made.count, 5)
+        XCTAssertEqual(Set(device.recycled), Set(made))
+        XCTAssertEqual(device.recycled.count, made.count, "no buffer recycled twice")
     }
 
     // MARK: - Lifetime
