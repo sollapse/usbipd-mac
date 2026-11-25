@@ -71,7 +71,7 @@ attach does.
 
 Mass storage works, measured on macOS 27.0.1 (M4 Mac mini) with a USB BD-RE drive
 (18a5:0428): first through `sudo usbipd probe`, then end to end, attached to Windows 11
-through usbip-win2 0.9.8.1 with a disc read. Four things it took:
+through usbip-win2 0.9.8.1 with a disc read. Five things it took:
 - **Capture terminates the storage driver.** The old interface node stays behind.
   Without a fresh selection the driver can be found back on it; selecting
   configuration 0, then the current one with `matchInterfaces: false`, gives a new
@@ -91,6 +91,20 @@ through usbip-win2 0.9.8.1 with a disc read. Four things it took:
   (0xe000404f). Both must become EPIPE: as EPROTO, Windows never cleared the halt or
   read the status, and USBSTOR failed the device with code 10. A drive with no disc
   stalls as a matter of course.
+- **The tray lock macOS leaves.** macOS locks a drive's tray while it has a disc, at
+  media detection and before any mount, and a capture terminates its drivers with the
+  lock still set. Windows' eject was then refused with ILLEGAL REQUEST 53/02 (medium
+  removal prevented), but only when macOS had held the drive with a disc in long enough.
+  After a capture, `IOUSBHostDeviceIO` sends every LUN of each bulk-only storage
+  interface PREVENT ALLOW MEDIUM REMOVAL (allow) through `BulkOnlyMediumLock`, before
+  the client has the device. A reset would clear the lock too, but `resetWithError`
+  ends the session and macOS's drivers would match the new device object and lock it
+  again. After the unlock the configuration is selected again: the exchange leaves the
+  bulk endpoints' data toggles on DATA1, the client's SET_CONFIGURATION is a no-op for
+  the current configuration, and Windows' first command block was then acknowledged
+  and dropped. That is most likely because its SET_INTERFACE reset the device's
+  toggles and not the host's; the INQUIRY hung for 20 seconds until Windows sent it
+  again.
 
 `usbipd probe` prints each step: interface registry IDs and attached drivers before
 and after. A device with mounted volumes is refused rather than captured.

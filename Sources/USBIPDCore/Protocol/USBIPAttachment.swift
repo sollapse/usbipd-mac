@@ -292,7 +292,7 @@ public final class USBIPAttachment: @unchecked Sendable {
                     logger.info("\(busid): clearing the halt on \(String(format: "0x%02x", endpoint)): \(error)")
                     return USBIPTransferStatus.urbStatus(for: result)
                 }
-                trace("the host refused CLEAR_FEATURE as a request (\(USBIOReturn.describe(result))); clearing its side only")
+                trace("the host refused CLEAR_FEATURE as a request (\(USBIOReturn.describe(result))); clearing the halt through the pipe instead")
             }
             resetHostSide(of: endpoint)
             return 0

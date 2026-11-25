@@ -87,6 +87,24 @@ read the status, every later command timed out, and USBSTOR gave up with code 10
 stall is now EPIPE, and the host's side is left for the client to clear, as Linux's
 server leaves it.
 
+### Fixed — a captured drive's tray stayed locked
+
+macOS locks a drive's tray with PREVENT ALLOW MEDIUM REMOVAL while it has a disc, and a
+capture terminates its storage drivers without them unlocking it. The client never set
+that lock and does not know to clear it, so its eject was refused. With the BD-RE drive
+attached to Windows, Explorer said "An error occurred while ejecting", and the drive's
+sense data was ILLEGAL REQUEST, 53/02, medium removal prevented. It happened when macOS
+had held the drive with a disc in long enough to lock it before an attach, so it came
+and went. Once it has captured a storage device, the daemon now sends each logical unit
+of its bulk-only interfaces PREVENT ALLOW MEDIUM REMOVAL allowing removal, before the
+client has the device. A unit attention that comes first is read and the command sent
+again; an exchange that goes wrong ends with the transport's reset recovery, so the
+client still starts clean. Then the daemon selects the configuration again. The
+exchange moves the bulk endpoints' data toggles off DATA0, where a client that has just
+configured the device expects them. Without the re-selection, the drive acknowledged
+Windows' first command block and never acted on it, and that first command hung for
+20 seconds.
+
 ### Fixed — isochronous transfers
 
 Isochronous calls passed no completion callback and freed their buffers while the

@@ -196,6 +196,25 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
             throw USBDeviceOpenError.interfacesStillHeld(busid: busid, interfaces: numbers,
                                                          holders: stillHeld.isEmpty ? holders : stillHeld)
         }
+        if io.releaseMediumLocks() {
+            // The unlock moved the bulk endpoints' data toggles off DATA0, where a client
+            // that has just configured the device expects them; its SET_CONFIGURATION is
+            // a no-op here, since the configuration is already selected. With a BD-RE
+            // drive, the client's first command block afterwards was acknowledged and
+            // never acted on, as a device does with a packet whose toggle marks it a
+            // repeat, most likely because the client's SET_INTERFACE reset the device's
+            // toggles but not the host's. Its first command hung for 20 seconds.
+            // Selecting the configuration again resets both sides, and leaves the device
+            // as one just configured.
+            do {
+                try io.reselectConfiguration(of: service)
+            } catch HeldInterfaces.held(let numbers) {
+                let stillHeld = driverNames(under: service, interfaces: numbers)
+                io.close()
+                throw USBDeviceOpenError.interfacesStillHeld(busid: busid, interfaces: numbers,
+                                                             holders: stillHeld.isEmpty ? holders : stillHeld)
+            }
+        }
         io.logger.info("Captured \(busid) from macOS's drivers (\(holders.joined(separator: ", ")))")
         return io
     }
@@ -213,9 +232,24 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         case needsFullDiskAccess(UInt8)
     }
 
+    /// Close the open interfaces, then select the configuration again, unmatched, and
+    /// open them anew.
+    private func reselectConfiguration(of service: io_service_t) throws {
+        lock.lock()
+        let old = Array(interfaces.values)
+        interfaces = [:]
+        alternates = [:]
+        pipes = [:]
+        endpoints = [:]
+        lock.unlock()
+        old.forEach { $0.destroy() }
+        try openInterfaces(of: service, reselectingConfiguration: true, heading: "Before selecting it again:")
+    }
+
     /// Open every interface of the current configuration, configuring the device first
     /// if nothing has, and selecting the configuration again first if asked to.
-    private func openInterfaces(of service: io_service_t, reselectingConfiguration: Bool = false) throws {
+    private func openInterfaces(of service: io_service_t, reselectingConfiguration: Bool = false,
+                                heading: String = "After the capture:") throws {
         if device.configurationDescriptor == nil {
             let first: UnsafePointer<IOUSBConfigurationDescriptor>
             do {
@@ -240,7 +274,7 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         // configuration, unmatched, makes interfaces nothing holds.
         if captured && reselectingConfiguration {
             Self.waitQuiet(service)
-            trace?("After the capture:")
+            trace?(heading)
             Self.interfaceReport(under: service).forEach { trace?("  \($0)") }
             do {
                 try device.__configure(withValue: 0, matchInterfaces: false)
@@ -709,6 +743,80 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
         }
     }
 
+    // MARK: - What macOS's storage drivers leave behind
+
+    /// Unlock the medium of every logical unit behind each bulk-only storage interface,
+    /// which macOS's drivers may have locked and the capture left locked. See
+    /// `BulkOnlyMediumLock`. Called once a captured device's interfaces are open, before
+    /// any client has it. Returns whether anything was sent to the device.
+    fileprivate func releaseMediumLocks() -> Bool {
+        lock.lock()
+        let storage = interfaces.compactMap { number, interface -> (number: UInt8, inbound: UInt8, outbound: UInt8)? in
+            let descriptor = interface.interfaceDescriptor.pointee
+            guard descriptor.bInterfaceClass == 0x08, descriptor.bInterfaceProtocol == 0x50 else { return nil }
+            let bulk = endpoints.values.filter { $0.interfaceNumber == number && $0.transferType == .bulk }
+            guard let inbound = bulk.first(where: { $0.address & 0x80 != 0 })?.address,
+                  let outbound = bulk.first(where: { $0.address & 0x80 == 0 })?.address else { return nil }
+            return (number: number, inbound: inbound, outbound: outbound)
+        }
+        lock.unlock()
+
+        for interface in storage.sorted(by: { $0.number < $1.number }) {
+            let pipes = CapturedBulkPipes(io: self, interface: interface.number,
+                                          inbound: interface.inbound, outbound: interface.outbound)
+            for lun in 0...maxLUN(of: interface.number) {
+                let line: String
+                switch BulkOnlyMediumLock.release(lun: lun, over: pipes) {
+                case .released:
+                    line = "Interface \(interface.number), LUN \(lun): medium removal allowed"
+                case .refused(let sense):
+                    line = "Interface \(interface.number), LUN \(lun): medium removal not allowed (\(sense))"
+                case .failed(let reason):
+                    line = "Interface \(interface.number), LUN \(lun): allowing medium removal failed (\(reason)); "
+                        + "the transport was reset"
+                }
+                trace?(line)
+            }
+        }
+        return !storage.isEmpty
+    }
+
+    /// GET MAX LUN: the highest logical unit number of a bulk-only interface. A device
+    /// with one unit may stall the request.
+    private func maxLUN(of interface: UInt8) -> UInt8 {
+        let setup = USBSetupPacket(bmRequestType: 0xA1, bRequest: 0xFE, wValue: 0,
+                                   wIndex: UInt16(interface), wLength: 1)
+        guard let data = NSMutableData(length: 1),
+              let count = try? sendControl(setup, data: data), count == 1 else { return 0 }
+        return min(data.bytes.load(as: UInt8.self), 15)
+    }
+
+    /// One bulk transfer, waited for, with a timeout. Only for what the daemon sends a
+    /// device itself; a client's transfers are queued and never time out.
+    fileprivate func transferSync(endpoint: UInt8, data: NSMutableData, timeout: TimeInterval) throws -> Int {
+        let pipe = try self.pipe(endpoint)
+        let done = DispatchSemaphore(value: 0)
+        let outcome = TransferOutcome()
+        let name = "Transfer on \(String(format: "0x%02x", endpoint))"
+        do {
+            try pipe.enqueueIORequest(with: data, completionTimeout: timeout) { status, transferred in
+                outcome.set(status, transferred)
+                done.signal()
+            }
+        } catch {
+            throw USBDeviceIOError(ioReturn(from: error), name)
+        }
+        if done.wait(timeout: .now() + timeout + 2) == .timedOut {
+            try? pipe.__abort(with: .synchronous)
+            throw USBDeviceIOError(USBIOReturn.timeout, name)
+        }
+        let (status, transferred) = outcome.value
+        guard status == kIOReturnSuccess else {
+            throw USBDeviceIOError(status, name)
+        }
+        return transferred
+    }
+
     // MARK: - Helpers
 
     private func pipe(_ endpoint: UInt8) throws -> IOUSBHostPipe {
@@ -916,6 +1024,58 @@ public final class IOUSBHostDeviceIO: USBDeviceIO, @unchecked Sendable {
 }
 
 /// The IOReturn behind an error thrown by IOUSBHost, whose NSErrors carry it as the code.
+/// A captured storage interface's bulk pipes, for `BulkOnlyMediumLock`.
+private struct CapturedBulkPipes: BulkOnlyPipes {
+    let io: IOUSBHostDeviceIO
+    let interface: UInt8
+    let inbound: UInt8
+    let outbound: UInt8
+
+    func write(_ data: Data, timeout: TimeInterval) throws {
+        _ = try io.transferSync(endpoint: outbound, data: NSMutableData(data: data), timeout: timeout)
+    }
+
+    func read(length: Int, timeout: TimeInterval) throws -> Data {
+        guard let buffer = NSMutableData(length: length) else {
+            throw USBDeviceIOError(USBIOReturn.badArgument, "Reading \(length) bytes")
+        }
+        let count = try io.transferSync(endpoint: inbound, data: buffer, timeout: timeout)
+        return Data(bytes: buffer.bytes, count: min(count, length))
+    }
+
+    func clearHalt(inbound isInbound: Bool) throws {
+        try io.clearHalt(endpoint: isInbound ? inbound : outbound)
+    }
+
+    func resetRecovery() throws {
+        let reset = USBSetupPacket(bmRequestType: 0x21, bRequest: 0xFF, wValue: 0,
+                                   wIndex: UInt16(interface), wLength: 0)
+        _ = try io.sendControl(reset, data: nil)
+        try io.clearHalt(endpoint: inbound)
+        try io.clearHalt(endpoint: outbound)
+    }
+}
+
+/// The result of one transfer, set from IOUSBHost's queue and read by the waiting thread.
+private final class TransferOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: IOReturn = kIOReturnSuccess
+    private var transferred = 0
+
+    func set(_ status: IOReturn, _ transferred: Int) {
+        lock.lock()
+        self.status = status
+        self.transferred = transferred
+        lock.unlock()
+    }
+
+    var value: (IOReturn, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (status, transferred)
+    }
+}
+
 func ioReturn(from error: Error) -> IOReturn {
     if let ioError = error as? USBDeviceIOError {
         return ioError.result
